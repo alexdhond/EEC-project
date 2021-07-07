@@ -1,0 +1,71 @@
+---
+title: "PREDICTS data exploration"
+author: "Alex Dhond"
+date: "7/7/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load all required packages
+```{r}
+library(sf)
+library(sp)
+library(raster)
+library(dplyr)
+library(spData)
+library(tmap)
+library(ggplot2)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(rnaturalearthhires)
+```
+
+
+Load the updated PREDICTS database and save it as dataframe
+```{r}
+diversity <- readRDS("diversity-2021-07-07-02-32-53.rds")
+```
+
+
+Subset to only insects then create dataframes with just Ant, Dung Beetle, and the combination of the two
+```{r}
+#subset out all other taxa except for insects
+insects <- droplevels(subset(diversity, Class=="Insecta"))
+
+#dung beetles
+DungBeetles <- droplevels(subset(insects, Family== "Scarabaeidae" | Family== "Geotrupidae"))
+
+#ants
+Ants <- droplevels(subset(insects, Family == "Formicidae"))
+
+#combination of both
+AntsDungBeetles <- droplevels(subset(insects, Family == "Scarabaeidae" | Family== "Geotrupidae" | Family == "Formicidae"))
+```
+
+
+Further subset this to only include sites from the Neotropical realm
+```{r}
+#ants
+NeotropicAnt <- droplevels(subset(Ants, Realm == "Neotropic"))
+
+#dung beetles
+NeotropicDungBeetle <- droplevels(subset(DungBeetles, Realm == "Neotropic"))
+
+#both
+NeotropicAntDungBeetle <- droplevels(subset(AntsDungBeetles, Realm == "Neotropic"))
+```
+
+Making the map data
+```{r}
+countries_sf <- ne_countries(scale = "large", returnclass = "sf")
+Neotropical <- countries_sf %>%
+  filter(subregion == "South America" & subregion == "North America" & subregion == "Central America")
+```
+
+
+
+
+
