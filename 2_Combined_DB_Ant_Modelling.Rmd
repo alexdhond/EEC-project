@@ -1,0 +1,1003 @@
+---
+title: "2_Combined_DB_Ant_Modelling"
+author: "Alex Dhond"
+date: "7/23/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+In this script I will run code to create a combined data-set of ants and dung beetles, and then create linear and generalized linear mixed effects models to see if the abundance and species richness responses differ from one another.
+
+### Clearing workspace prior to running the script
+```{r}
+rm(list=ls())
+```
+
+### Load all required packages
+```{r}
+## Data manipulation ## 
+library(dplyr) # data manipulation
+library(tidyr) # data manipulation
+
+## Modelling ## 
+library(lme4) # creating mixed effects models
+library(car) # for LRT / anova comparisons
+library(merTools) # for extracting model estimates
+library(MuMIn) # for assessing model fit
+library(optimx) #optimizing models
+library(DHARMa) #for model validation
+
+## Plotting ## 
+library(ggplot2) # basic plotting package
+library(ggpubr) # for arranging and exporting plots
+library(cowplot) # for arranging and exporting plots
+```
+
+### Load in all required functions
+```{r}
+## Load in the source function for checking GVIFs - for collinearity
+source("https://highstat.com/Books/Book2/HighstatLibV10.R")
+
+## Load in a model criticism function - this function is used for checking the residual/model diagnostic plots to test that the model is meeting all of its assumptions
+model_plot <-function(mod.for.plot){
+  require(lattice)
+  
+  # set up a 2 x 2 grid for plotting
+  par(mfrow = c(1,3))
+  par(ask = TRUE)
+  
+  # qqplot
+  qqnorm(resid(mod.for.plot))
+  qqline(resid(mod.for.plot), col = 2)
+  
+  # residuals vs fitted plot
+  plot(fitted(mod.for.plot), resid(mod.for.plot),xlab = "Fitted Values", ylab = "Residuals", main = "Residuals vs fitted")
+  abline(h=0, lty=2)
+  lines(smooth.spline(fitted(mod.for.plot), resid(mod.for.plot)), col = "red")
+  
+  # histogram of residuals
+  hist(resid(mod.for.plot))
+  
+  # random effects distribution
+  dotplot(ranef(mod.for.plot,condVar = TRUE))
+}
+
+## Load in an overdispersion function from this website to help test if the models are overdispersed.
+# https://bbolker.github.io/mixedmodels-misc/glmmFAQ.html#testing-for-overdispersioncomputing-overdispersion-factor
+overdisp_fun <- function(model) {
+    rdf <- df.residual(model)
+    rp <- residuals(model,type="pearson")
+    Pearson.chisq <- sum(rp^2)
+    prat <- Pearson.chisq/rdf
+    pval <- pchisq(Pearson.chisq, df=rdf, lower.tail=FALSE)
+    c(chisq=Pearson.chisq,ratio=prat,rdf=rdf,p=pval)
+}
+```
+
+### Read in the CSV of the combined ant and dung beetles
+```{r}
+NeoAntDungBeetles <- read.csv("NeoAntDungBeetles.csv")
+```
+
+### Create a new column that has the dung beetle families combined as well as ants
+Because dung beetles are made up of two families (Geotrupidae and Scarabaeidae) I need to combine the families together.
+```{r}
+# Make a new column "Family_combined" to put in either Ants or Dung beetles depending on the family
+NeoAntDungBeetles <- NeoAntDungBeetles %>%
+  mutate(Family_combined = ifelse(Family == "Formicidae", "Ants", "Dung_beetles"))
+```
+
+### Create Dung beetle and ant sites - for looking at general land use/LUI/use intensity differences
+```{r}
+NeoAntDungBeetleSites <- NeoAntDungBeetles %>%
+
+  # pull out only the merged diversity data
+  distinct(merge_ID, .keep_all = TRUE) %>%
+  
+  # re-make SSB and SSBS values 
+  mutate(SS = paste(Source_ID, Study_number),
+         SSB = paste(SS, Block),
+         SSBS = paste(SSB, Site_number)) %>%
+  
+  # group by SSBS (each unique value corresponds to a unique site)
+  group_by(SSBS, Family_combined) %>%
+  
+  # now add up all the abundance measurements within each site
+  mutate(TotalAbundance = ifelse(Diversity_metric_type == "Abundance",
+                                 sum(merged_diversity),
+                                 # if the diversity metric type isn't Abundance, then leave the TotalAbundance measurement as NA
+                                 NA),
+         
+         # if the metric is already species richness
+         SpeciesRichness = ifelse(Diversity_metric_type == "Species richness",
+                                  # just use the value as given
+                                  merged_diversity,
+                                  # for abundance and occurrence measurements, count the number of unique species names that are present at the site 
+                                  n_distinct(Taxon_name_entered[merged_diversity > 0])),
+         
+         # calculate Chao's Species Richness Estimator
+         # if the diversity metric is suitable for this calculation
+         ChaoRichness = ifelse(Diversity_metric_is_suitable_for_Chao == TRUE,
+                               # calculate the Chao estimator
+                               sum(merged_diversity > 0) + (((sum(merged_diversity == 1) * (sum(merged_diversity == 1)-1)) / (2*(sum(merged_diversity == 2)+1)))),
+                               # otherwise give Chao NA
+                               NA)
+         ) %>%
+  
+  # ungroup
+  ungroup() %>%
+  
+    # now group by Study ID
+  group_by(SS, Family_combined) %>%
+  
+  # pull out some useful study-level numbers
+  # maximum abundance for each study
+  mutate(MaxAbundance = max(TotalAbundance),
+         # minimum (non-zero) abundance for each study
+         # for species rarefaction
+         MinNonZeroAbundance = min(TotalAbundance[TotalAbundance > 0]),
+         # number of species in the study
+         SpeciesInStudy = n_distinct(Taxon_name_entered[merged_diversity > 0]),
+         # assess whether the study is suitable for rarefaction
+         SuitableForRarefaction = ifelse(
+           # if all diversity measurements are integers
+           # i.e. if you round down, it should be equal to the original number
+           # and the diversity metric is suitable for Chao
+           all(floor(merged_diversity) == merged_diversity) &
+             Diversity_metric_is_suitable_for_Chao == TRUE,
+           # then class the study as suitable for rarefaction
+           TRUE,
+           # otherwise it can't be used
+           FALSE
+           )
+         ) %>%
+  
+  # ungroup
+  ungroup()  %>%
+  
+  # now rescale total abundance, so that within each study, abundance varies from 0 to 1.
+  mutate(RescaledAbundance = TotalAbundance/MaxAbundance,
+         # for statistical modelling,  calculate the square root of species abundance, although might want to use log(x+1) transformation instead
+         sqrtRescaledAbundance = sqrt(RescaledAbundance),
+         logRescaledAbundance = log(RescaledAbundance + 1)
+         )
+
+# pull out unique sites
+NeoAntDungBeetleSites <- NeoAntDungBeetleSites %>%
+  distinct(SSBS, Family_combined, .keep_all = TRUE)
+```
+
+### Look at the site data, and collapse variables with little/no data
+```{r}
+NeoAntDungBeetleSites <- NeoAntDungBeetleSites %>%
+  
+  mutate(
+
+    #collapse primary vegetation together
+    Predominant_land_use = recode_factor(Predominant_land_use, 
+                                  "Primary forest" = "Primary vegetation", 
+                                  "Primary non-forest" = "Primary vegetation"),
+    
+    # indeterminate secondary veg and cannot decide get NA
+    Predominant_land_use = na_if(Predominant_land_use, "Secondary vegetation (indeterminate age)"),
+    Predominant_land_use = na_if(Predominant_land_use, "Cannot decide"),
+    Use_intensity = na_if(Use_intensity, "Cannot decide"),
+
+  )
+
+#remove urban sites
+NeoAntDungBeetleSites <- droplevels(subset(NeoAntDungBeetleSites, Predominant_land_use != "Urban"))
+
+# take another look at the LandUse/Use intensity split
+table(NeoAntDungBeetleSites$Predominant_land_use, NeoAntDungBeetleSites$Use_intensity, NeoAntDungBeetleSites$Family_combined) 
+```
+
+Due to imbalances in the data, I can only look at predominant land use, and not the more coarse LUI, when comparing ants and dung beetles. I want to have at least 30 observations in each category (for both groups of species) so unfortunately I cannot do a finer LUI classification.
+
+### Rename the land use classifications so it is easier to read
+First revalue/relabel the land use categories so that graphs are easier to read. Then recode the levels so that when modelling they appear with primary vegetation as the reference level (and on graphs they go in an intuitive order)
+```{r}
+## Revalue the factors so they go in logical order
+NeoAntDungBeetleSites <- NeoAntDungBeetleSites %>%
+  mutate(Predominant_land_use = plyr::revalue(Predominant_land_use, c("Primary vegetation" = "Primary",
+                                    "Mature secondary vegetation" = "MSV",
+                                    "Intermediate secondary vegetation" = "ISV",
+                                    "Young secondary vegetation" = "YSV",
+                                    "Plantation forest" = "Plantation",
+                                    "Pasture" = "Pasture",
+                                    "Cropland" = "Cropland")))
+
+## Check to see the names are new
+table(NeoAntDungBeetleSites$Predominant_land_use)
+
+## Now re-code the levels
+levels(NeoAntDungBeetleSites$Predominant_land_use)
+
+#recode the levels
+NeoAntDungBeetleSites$Predominant_land_use <- factor(NeoAntDungBeetleSites$Predominant_land_use, levels = c("Primary", "MSV", "ISV", "YSV", "Plantation", "Pasture", "Cropland"))
+
+#check it worked
+levels(NeoAntDungBeetleSites$Predominant_land_use)
+```
+
+### check the number of sources sites and studies
+```{r}
+length(unique(NeoAntDungBeetleSites$Source_ID)) #number of sources
+length(unique(NeoAntDungBeetleSites$SS)) #number of studies
+length(unique(NeoAntDungBeetleSites$SSBS)) #number of sites
+```
+
+The combined data should be in order now for modelling. Now create the model data (need to drop out any NAs that would interfere with the models being run).
+
+For the model data, I am going to model abundance (log and sqrt transformed) as well as Species richness.
+
+## Create the combined dataset
+```{r}
+## Create the combined abundance dataframe, dropping NAs from the relevant columns
+model_data_comb_ab <- drop_na(NeoAntDungBeetleSites,
+                              RescaledAbundance, Predominant_land_use, Family_combined)
+
+# Add in the transformed log and sqrt abundances
+model_data_comb_ab <- mutate(model_data_comb_ab, 
+                        logAbundance = log(RescaledAbundance + 1),
+                        sqrtAbundance = sqrt(RescaledAbundance))
+
+## Create the combined Species richness dataframe, dropping out NAs
+model_data_comb_sr <- drop_na(NeoAntDungBeetleSites,
+                              SpeciesRichness, Predominant_land_use, Family_combined)
+
+## In case of overdispersion, add in a row-level random effect
+model_data_comb_sr$Row_random_effect <- 1:nrow(model_data_comb_sr)
+```
+
+Now that the model dataframes have been created, I can run models on transformed abundances for the combined dataset. I will start with species richness
+
+## SPECIES RICHNESS - check interaction between land use and dung beetle and ants
+
+### First check for collinearity between the predictor variables
+I don't expect there to be any collinearity between predominant land use and Family_combined, but I will check anyway
+```{r}
+## Test for collinearity
+corvif(NeoAntDungBeetleSites[ , c("Predominant_land_use", "Family_combined")])
+```
+
+### Create models and proceed with backwards stepwise selection
+```{r}
+## Create the maximal model
+m1 <- glmer(SpeciesRichness ~ Predominant_land_use*Family_combined + (1|SS) + (1|SSB), 
+            data = model_data_comb_sr,
+            family = "poisson",
+            )
+
+## Remove random effects to test 
+m2 <- glmer(SpeciesRichness ~ Predominant_land_use*Family_combined + (1|SS), 
+            data = model_data_comb_sr,
+            family = "poisson",
+            )
+
+## Remove study
+m3 <- glmer(SpeciesRichness ~ Predominant_land_use*Family_combined + (1|SSB), 
+            data = model_data_comb_sr,
+            family = "poisson",
+            control = glmerControl("optimx", optCtrl=list(method="nlminb")))
+
+## Check the AIC of the models to see which random effects structure has the lowest AIC
+AIC(m1, m2, m3)
+
+## Model m1 is the best random effect structure
+
+## Proceed with backwards stepwise selection of fixed effects
+
+## Remove the interaction term but keep the family_combined variable
+m4 <- glmer(SpeciesRichness ~ Predominant_land_use + Family_combined + (1|SS) + (1|SSB), 
+            data = model_data_comb_sr,
+            family = "poisson",
+            )
+
+## Remove the family combined variable
+m5 <- glmer(SpeciesRichness ~ Predominant_land_use + (1|SS) + (1|SSB), 
+            data = model_data_comb_sr,
+            family = "poisson",
+            )
+
+## Remove predominant land use
+m6 <- glmer(SpeciesRichness ~ Family_combined + (1|SS) + (1|SSB), 
+            data = model_data_comb_sr,
+            family = "poisson",
+            )
+
+## Create a null model with no fixed effects
+m7 <- glmer(SpeciesRichness ~ (1|SS) + (1|SSB), 
+            data = model_data_comb_sr,
+            family = "poisson",
+            )
+
+## Compare the models
+anova(m1, m4, m5, m6, m7)
+model.sel(m1, m4, m5, m6, m7)
+AIC(m1, m4, m5, m6, m7)
+
+## Model m1 is the best model with the lowest AIC
+
+## Check anova
+Anova(m1)
+```
+
+The maximal model, m1, is the most significant model with the lowest AIC. I will now test it for overdispersion.
+
+### Test the model for overdispersion
+```{r}
+## Use the overdisp function
+overdisp_fun(m1)
+```
+
+Because the p-value is significant, the model is overdispersed. I will now add in another random effect to account for overdispersion
+
+### Add in another random effect to account for over dispersion
+```{r}
+## Add each row (essentially site) as a random effect
+m8 <- glmer(SpeciesRichness ~ Predominant_land_use*Family_combined + (1|SS) + (1|SSB) + (1|Row_random_effect), 
+            data = model_data_comb_sr,
+            family = "poisson",
+            control = glmerControl(optimizer = "bobyqa"))
+
+## Check for overdispersion
+overdisp_fun(m8)
+```
+
+The p-value for m8 overdispersion test is not significant, so model m8 should be acceptable to model with.
+
+### Check DHARMa model diagnostics for species richness model
+```{r}
+# look at the model criticism plots
+model_plot(m8)
+## Simulate the residuals of the model using DHARMa
+m8_residuals <- simulateResiduals(fittedModel = m8, plot = F)
+
+## Plot them
+plot(m8_residuals)
+
+## Test the outliers and test for dispersion
+testOutliers(m8_residuals)
+testDispersion(m8_residuals)
+```
+
+Evidently my model has some outliers. I have tested for overdispersion, and the model is not over-dispersed. 
+
+### Before I move on, get the summary statistics and anova values, as well as any other relevant information for the methods section
+```{r}
+## First, make a model to compare the interaction term between land use and family combined
+m4_test <- glmer(SpeciesRichness ~ Predominant_land_use + Family_combined + (1|SS) + (1|SSB) + (1|Row_random_effect), 
+            data = model_data_comb_sr,
+            family = "poisson",
+            )
+
+## Use anova to check if the interaction is significant
+anova(m4_test, m8)
+
+## Comparing the model m4a_test to m8, the interaction between land use and family was significant. Chi squared = 34.12, df = 6, p  = 6.377e-06 *** (copy this to methods)
+
+## get the summary statistics
+summary(m8)
+```
+
+# ABUNDANCE
+## Make the sqrt abundance models 
+
+### Create sqrt abundance models and proceed with backwards stepwise selection
+```{r}
+## Start with removing the random effects 
+
+## Create the maximal model
+m1a <- lmer(sqrtAbundance ~ Predominant_land_use*Family_combined + (1|SS) + (1|SSB), data = model_data_comb_ab)
+
+## Remove block
+m2a <- lmer(sqrtAbundance ~ Predominant_land_use*Family_combined + (1|SS), data = model_data_comb_ab)
+
+## Remove study, keep block
+m3a <- lmer(sqrtAbundance ~ Predominant_land_use*Family_combined + (1|SSB), data = model_data_comb_ab)
+
+## Compare the models for the best random effects structure
+AIC(m1a, m2a, m3a)
+
+## Model m1a has the lowest AIC, so that random effects structure is the best
+
+## Backwards stepwise selection of fixed effects 
+
+## Model with the interaction removed but both predictors still present
+m4a<- lmer(sqrtAbundance ~ Predominant_land_use + Family_combined + (1|SS) + (1|SSB), data = model_data_comb_ab)
+
+## Sqrt abundance model with just land use as predictor
+m5a <- lmer(sqrtAbundance ~ Predominant_land_use + (1|SS) + (1|SSB), data = model_data_comb_ab)
+
+## Model with just family_combined as the predictor
+m6a <- lmer(sqrtAbundance ~ Family_combined + (1|SS) + (1|SSB), data = model_data_comb_ab)
+
+## Make a null, intercept only model
+m7a <- lmer(sqrtAbundance ~ (1|SS) + (1|SSB), data = model_data_comb_ab)
+
+
+## Compare the models via anova and model.sel
+anova(m1a, m4a, m5a, m6a, m7a)
+model.sel(m1a, m4a, m5a, m6a, m7a)
+AIC(m1a, m4a, m5a, m6a, m7a)
+
+anova(m1a, m4a)
+
+## From these tests, it seems that model m1a is the best
+```
+
+For the sqrt abundance models, model m1a is the best model
+
+### Check model diagnostics for model m1a
+```{r}
+## Check the residuals from the model criticism function
+model_plot(m1a)
+
+## Simulate the residuals 
+m1a_residuals <- simulateResiduals(fittedModel = m6a, plot = F)
+
+## Plot them
+plot(m1a_residuals)
+
+testOutliers(m1a_residuals)
+testDispersion(m1a_residuals)
+
+## Check for overdispersion with the loaded function
+overdisp_fun(m1a)
+```
+
+The sqrt abundance model, m1a, shows relatively normal distribution of residuals. It seems to be pretty good
+
+Move onto log abundance.
+
+## Create the log abundance models
+```{r}
+## Start with removing the random effects 
+
+## Create the maximal model
+m1a1 <- lmer(logAbundance ~ Predominant_land_use*Family_combined + (1|SS) + (1|SSB), data = model_data_comb_ab)
+
+## Remove block
+m2a1 <- lmer(logAbundance ~ Predominant_land_use*Family_combined + (1|SS), data = model_data_comb_ab)
+
+## Remove study, keep block
+m3a1 <- lmer(logAbundance ~ Predominant_land_use*Family_combined + (1|SSB), data = model_data_comb_ab)
+
+## Compare the models for the best random effects structure
+AIC(m1a1, m2a1, m3a1)
+
+## Model m1a has the lowest AIC, so that random effects structure is the best
+
+## Backwards stepwise selection of fixed effects 
+
+## Model with the interaction removed but both predictors still present
+m4a1 <- lmer(logAbundance ~ Predominant_land_use + Family_combined + (1|SS) + (1|SSB), data = model_data_comb_ab)
+
+## Sqrt abundance model with just land use as predictor
+m5a1 <- lmer(logAbundance ~ Predominant_land_use + (1|SS) + (1|SSB), data = model_data_comb_ab)
+
+## Model with just family_combined as the predictor
+m6a1 <- lmer(logAbundance ~ Family_combined + (1|SS) + (1|SSB), data = model_data_comb_ab)
+
+## Make a null, intercept only model
+m7a1 <- lmer(logAbundance ~ (1|SS) + (1|SSB), data = model_data_comb_ab)
+
+
+## Compare the models via anova and model.sel
+anova(m1a1, m4a1, m5a1, m6a1, m7a1)
+model.sel(m1a1, m4a1, m5a1, m6a1, m7a1)
+AIC(m1a1, m4a1, m5a1, m6a1, m7a1)
+
+## Compare the best two models
+anova(m1a1, m4a1)
+
+## From these tests, it seems that model m1a1 is the best
+```
+
+### Check the summary statistics and diagnostic plots for this model
+```{r}
+## Check the model diagnostics
+model_plot(m1a1)
+
+## Simulate the residuals 
+m1a1_residuals <- simulateResiduals(fittedModel = m1a1, plot = F)
+
+## Plot them
+plot(m1a1_residuals)
+
+## Once again the plots are extremely skewed
+testDispersion(m1a1_residuals)
+
+## Test for overdispersion
+overdisp_fun(m1a1)
+```
+
+The log abundance model, m1a1, shows a lot more skew than the sqrt abundance model. As such, I will probably use the sqrt abundance model as my go to model.
+
+
+
+
+# PLOTTING AND VISUALIZATION
+
+# Visualize the data
+
+### Graph sqrt and log abundance
+```{r}
+## Sqrt abundance graph
+ggplot(model_data_comb_ab, aes(x = Predominant_land_use, y = sqrtAbundance, colour = Family_combined))+
+  geom_boxplot()+
+  theme(axis.text.x = element_text(angle = 45))
+
+## Log abundance graph
+ggplot(model_data_comb_ab, aes(x = Predominant_land_use, y = logAbundance, colour = Family_combined))+
+  geom_boxplot()+
+  theme(axis.text.x = element_text(angle = 45))
+
+## Species richness graph
+ggplot(model_data_comb_sr, aes(x = Predominant_land_use, y = SpeciesRichness, colour = Family_combined))+
+  geom_boxplot()+
+  theme(axis.text.x = element_text(angle = 45))+
+  theme(legend.position = "none")
+```
+
+Now I will generate the effects of the combined SR model to make a figure and plot how ants and dung beetles are responding differently. Here, I will need to create two dataframes, one with only the dung beetle effects, and one with only the ant effects. I will transform the effects into percentage differences, then combine the dataframes into one for plotting
+
+## Create the dung beetle effects dataframe
+
+### First create a new model with dung beetles as the reference category
+```{r}
+## Make the "Family_combined" column a factor
+model_data_comb_sr$Family_combined <- as.factor(model_data_comb_sr$Family_combined)
+
+## Create model dataframe with dung beetle as reference category
+model_db_sr <- within(model_data_comb_sr, Family_combined <- relevel(Family_combined, ref = "Dung_beetles"))
+
+## Create model 8 with dung beetles
+m8_db <- glmer(SpeciesRichness ~ Predominant_land_use*Family_combined + (1|SS) + (1|SSB) + (1|Row_random_effect), 
+            data = model_db_sr,
+            family = "poisson",
+            control = glmerControl("bobyqa"))
+```
+
+### Check effects for methods
+```{r}
+summary(m8_db)
+summary(m)
+```
+
+### Simulate the db model effects
+```{r}
+# gather the effects and confidence intervals using simulation. Simulate 1000 times
+db_eff <- FEsim(m8_db, 1000)
+
+# make the term column a factor so it can be recoded
+db_eff$term <- as.factor(db_eff$term)
+
+# pull out dung beetle effects
+db_eff <- db_eff %>%
+  slice(1:7)
+
+# recode the factors to make them shorter (so I can visualise easier)
+db_eff$term <- recode_factor(db_eff$term, "(Intercept)" = "Primary",
+                              "Predominant_land_useMSV" = "MSV",
+                              "Predominant_land_useISV" = "ISV",
+                              "Predominant_land_useYSV" = "YSV",
+                              "Predominant_land_usePlantation" = "Plantation",
+                              "Predominant_land_usePasture" = "Pasture",
+                              "Predominant_land_useCropland" = "Cropland")
+
+# Add in upper and lower confidence intervals 
+db_eff <- db_eff %>%
+  mutate(Upper_ci = (median + 1.96*sd)) %>%
+  mutate(Lower_ci = (median - 1.96*sd))
+
+# Back transform the estimates and generate percentage differences from the baseline (first term, Primary Vegetation (PV))
+db_eff <- db_eff %>%
+ mutate(
+    Percent_diff = ((((exp(median[1] + median)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_upper = ((((exp(median[1] + Upper_ci)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_lower = ((((exp(median[1] + Lower_ci)) / exp(median[1]))*100)-100))
+
+# Shift the baseline down to 0
+db_eff[1,7] <- 0 #shift median
+db_eff[1,8] <- 0 #shift upper
+db_eff[1,9] <- 0 #shift lower 
+
+# Rename the sim eff term column name to LUI for joining
+colnames(db_eff)[1] <- "Predominant_land_use"
+```
+
+### Create the ant effects dataframe
+```{r}
+# gather the effects and confidence intervals using simulation. Simulate 10000 times
+ant_eff <- FEsim(m8, 1000)
+
+# make the term column a factor so it can be recoded
+ant_eff$term <- as.factor(ant_eff$term)
+
+# Pull out only ant terms
+ant_eff <- ant_eff %>%
+  slice(1:7)
+
+# recode the factors to make them shorter (so I can visualise easier)
+ant_eff$term <- recode_factor(ant_eff$term, "(Intercept)" = "Primary",
+                              "Predominant_land_useMSV" = "MSV",
+                              "Predominant_land_useISV" = "ISV",
+                              "Predominant_land_useYSV" = "YSV",
+                              "Predominant_land_usePlantation" = "Plantation",
+                              "Predominant_land_usePasture" = "Pasture",
+                              "Predominant_land_useCropland" = "Cropland")
+
+# Add in upper and lower confidence intervals 
+ant_eff <- ant_eff %>%
+  mutate(Upper_ci = (median + 1.96*sd)) %>%
+  mutate(Lower_ci = (median - 1.96*sd))
+
+# Back transform the estimates and generate percentage differences from the baseline (first term, Primary Vegetation (PV)
+ant_eff <- ant_eff %>%
+ mutate(
+    Percent_diff = ((((exp(median[1] + median)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_upper = ((((exp(median[1] + Upper_ci)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_lower = ((((exp(median[1] + Lower_ci)) / exp(median[1]))*100)-100))
+
+# Shift the baseline down to 0
+ant_eff[1,7] <- 0 #shift median
+ant_eff[1,8] <- 0 #shift upper
+ant_eff[1,9] <- 0 #shift lower 
+
+# Rename the sim eff term column name to LUI for joining
+colnames(ant_eff)[1] <- "Predominant_land_use"
+```
+
+### Combine the dataframes together
+Add in a column of "Family_combined" to make sure there is a grouping variable
+```{r}
+comb_sr_eff <- rbind(db_eff, ant_eff)
+comb_sr_eff$Family_combined <- c("Dung beetles", "Dung beetles", "Dung beetles", "Dung beetles", "Dung beetles", "Dung beetles", "Dung beetles","Ants", "Ants", "Ants", "Ants", "Ants", "Ants", "Ants")
+```
+
+### Finally, plot the combined effect estimates
+
+### Create necessary vectors and objects for plotting
+```{r}
+## Make grouping colors
+color <- c("#00BFC4", "#F8766D")
+
+## set the x axis limits
+comb_plot_limits <- c("Primary", "MSV", "ISV", "YSV", "Plantation", "Pasture", "Cropland")
+```
+
+### Plot the percentage differences - SPECIES RICHNESS
+```{r}
+## Plot the effect estimate as the percent species richness difference from primary vegetation
+species_richness <- comb_sr_eff %>%
+  ggplot()+
+  aes(x = Predominant_land_use, y = Percent_diff, colour = Family_combined)+
+  geom_hline(yintercept = 0, size = 0.5, color = ("black"), linetype = 1)+
+  geom_point(size = 3, position = position_dodge(width = 0.5))+
+  geom_linerange(aes(ymin = Percent_lower, ymax = Percent_upper), position = position_dodge(width = 0.5), size = 1)+
+  theme_classic()+
+  scale_x_discrete(limits=comb_plot_limits)+
+  geom_vline(xintercept = 1.5, linetype = 2)+
+  geom_vline(xintercept = 2.5, linetype = 2)+
+  geom_vline(xintercept = 3.5, linetype = 2)+
+  geom_vline(xintercept = 4.5, linetype = 2)+
+  geom_vline(xintercept = 5.5, linetype = 2)+
+  geom_vline(xintercept = 6.5, linetype = 2)+
+  theme(axis.text.x = element_text(face= "bold", angle = 45, hjust = 1),
+        axis.title.x = element_blank(),
+        axis.title.y = element_text(face = "bold"),
+        legend.position = "none",
+        panel.border = element_rect(colour = "black",  fill=NA))+
+  xlab("Land use intensity class")+
+  ylab("Species richness difference (%)")+
+  scale_colour_manual(legend_title, values = color)
+species_richness
+```
+
+From the figure, it is clear that across most land-use types, ant and dung beetle species richness responds similarly, except in mature secondary vegetation and cropland. N = 2086 observations
+
+# ABUNDANCE EFFECTS VISUALIZATION
+
+## Create the dung beetle effects dataframe
+
+### First create a new model with dung beetles as the reference category
+```{r}
+## Make the "Family_combined" column a factor
+model_data_comb_ab$Family_combined <- as.factor(model_data_comb_ab$Family_combined)
+
+## Create model dataframe with dung beetle as reference category
+model_db_ab <- within(model_data_comb_ab, Family_combined <- relevel(Family_combined, ref = "Dung_beetles"))
+
+## Create log abundance model
+m1a1_db <- lmer(logAbundance ~ Predominant_land_use*Family_combined + (1|SS) + (1|SSB), data = model_db_ab)
+
+## sqrt abundance model
+m1a_db <- lmer(sqrtAbundance ~ Predominant_land_use*Family_combined + (1|SS) + (1|SSB), data = model_db_ab)
+```
+
+### Make db effects for LOG ABUNDANCE models
+```{r}
+# gather the effects and confidence intervals using simulation. Simulate 1000 times
+db_eff_ab <- FEsim(m1a1_db, 1000)
+
+# make the term column a factor so it can be recoded
+db_eff_ab$term <- as.factor(db_eff_ab$term)
+
+# pull out dung beetle effects
+db_eff_ab <- db_eff_ab %>%
+  slice(1:7)
+
+# recode the factors to make them shorter (so I can visualise easier)
+db_eff_ab$term <- recode_factor(db_eff_ab$term, "(Intercept)" = "Primary",
+                              "Predominant_land_useMSV" = "MSV",
+                              "Predominant_land_useISV" = "ISV",
+                              "Predominant_land_useYSV" = "YSV",
+                              "Predominant_land_usePlantation" = "Plantation",
+                              "Predominant_land_usePasture" = "Pasture",
+                              "Predominant_land_useCropland" = "Cropland")
+
+# Add in upper and lower confidence intervals 
+db_eff_ab <- db_eff_ab %>%
+  mutate(Upper_ci = (median + 1.96*sd)) %>%
+  mutate(Lower_ci = (median - 1.96*sd))
+
+# Back transform the log abundance estimates so that I get a measure of abundance
+db_eff_ab <- db_eff_ab %>%
+  mutate(
+    Percent_diff = (((exp(median[1] + median) - 1) / (exp(median[1]) - 1))*100)-100) %>%
+  mutate(
+    Percent_upper = (((exp(median[1] + Upper_ci) - 1) / (exp(median[1]) - 1)) * 100) - 100) %>%
+  mutate(
+    Percent_lower = (((exp(median[1] + Lower_ci) - 1) / (exp(median[1]) - 1)) * 100) - 100)
+
+# Shift the baseline down to 0
+db_eff_ab[1,7] <- 0 #shift median
+db_eff_ab[1,8] <- 0 #shift upper
+db_eff_ab[1,9] <- 0 #shift lower 
+
+# Rename the sim eff term column name to LUI for joining
+colnames(db_eff_ab)[1] <- "Predominant_land_use"
+```
+
+### Create the ant effects dataframe
+```{r}
+# gather the effects and confidence intervals using simulation. Simulate 10000 times
+ant_eff_ab <- FEsim(m1a, 1000)
+
+# make the term column a factor so it can be recoded
+ant_eff_ab$term <- as.factor(ant_eff_ab$term)
+
+# Pull out only ant terms
+ant_eff_ab <- ant_eff_ab %>%
+  slice(1:7)
+
+# recode the factors to make them shorter (so I can visualise easier)
+ant_eff_ab$term <- recode_factor(ant_eff_ab$term, "(Intercept)" = "Primary",
+                              "Predominant_land_useMSV" = "MSV",
+                              "Predominant_land_useISV" = "ISV",
+                              "Predominant_land_useYSV" = "YSV",
+                              "Predominant_land_usePlantation" = "Plantation",
+                              "Predominant_land_usePasture" = "Pasture",
+                              "Predominant_land_useCropland" = "Cropland")
+
+# Add in upper and lower confidence intervals 
+ant_eff_ab <- ant_eff_ab %>%
+  mutate(Upper_ci = (median + 1.96*sd)) %>%
+  mutate(Lower_ci = (median - 1.96*sd))
+
+# Back transform the log abundance estimates so that I get a measure of abundance
+ant_eff_ab <- ant_eff_ab %>%
+  mutate(
+    Percent_diff = (((exp(median[1] + median) - 1) / (exp(median[1]) - 1))*100)-100) %>%
+  mutate(
+    Percent_upper = (((exp(median[1] + Upper_ci) - 1) / (exp(median[1]) - 1)) * 100) - 100) %>%
+  mutate(
+    Percent_lower = (((exp(median[1] + Lower_ci) - 1) / (exp(median[1]) - 1)) * 100) - 100)
+
+# Shift the baseline down to 0
+ant_eff_ab[1,7] <- 0 #shift median
+ant_eff_ab[1,8] <- 0 #shift upper
+ant_eff_ab[1,9] <- 0 #shift lower 
+
+# Rename the sim eff term column name to LUI for joining
+colnames(ant_eff_ab)[1] <- "Predominant_land_use"
+```
+
+### Combine the dataframes together
+Add in a column of "Family_combined" to make sure there is a grouping variable
+```{r}
+comb_log_ab <- rbind(db_eff_ab, ant_eff_ab)
+comb_log_ab$Family_combined <- c("Dung beetles", "Dung beetles", "Dung beetles", "Dung beetles", "Dung beetles", "Dung beetles", "Dung beetles","Ants", "Ants", "Ants", "Ants", "Ants", "Ants", "Ants")
+```
+
+### Finally, plot the combined effect estimates
+```{r}
+## Plot the effect estimate as the percent species richness difference from primary vegetation
+comb_log_ab %>%
+  ggplot()+
+  aes(x = Predominant_land_use, y = Percent_diff, colour = Family_combined)+
+  geom_point(size = 2, position = position_dodge(width = 0.5))+
+  geom_errorbar(aes(ymin = Percent_lower, ymax = Percent_upper), position = position_dodge(width = 0.5), size = 0.75, width = 0.2)+
+  geom_hline(yintercept = 0, size = I(1), color = I("black"), linetype = 1 )+
+  theme_light()+
+  theme(axis.text.x = element_text(colour = c("#000000", "#E69F00", "#56B4E9", "#009E73",  "#F0E442", "#0072B2","#D55E00"),face= "bold", angle = 45, hjust = 1),
+        axis.title.x = element_blank(),
+        axis.title.y = element_text(face = "bold"))+
+  xlab("Land use intensity class")+
+  ylab("Total abundance difference (%)")+
+  scale_colour_manual(legend_title, values = color)
+```
+This is the result of the log abundance model, back transformed. I dont want to use this graph
+
+Figure x: Total abundance difference from primary vegetation for ants and dung beetles. 
+
+
+```{r}
+summary(m1a_db)
+```
+
+### Do the same for the sqrt abundance model
+```{r}
+# gather the effects and confidence intervals using simulation. Simulate 1000 times
+db_eff_sqrt_ab <- FEsim(m1a_db, 1000)
+
+# make the term column a factor so it can be recoded
+db_eff_sqrt_ab$term <- as.factor(db_eff_sqrt_ab$term)
+
+# pull out dung beetle effects
+db_eff_sqrt_ab <- db_eff_sqrt_ab %>%
+  slice(1:7)
+
+# recode the factors to make them shorter (so I can visualise easier)
+db_eff_sqrt_ab$term <- recode_factor(db_eff_sqrt_ab$term, "(Intercept)" = "Primary",
+                              "Predominant_land_useMSV" = "MSV",
+                              "Predominant_land_useISV" = "ISV",
+                              "Predominant_land_useYSV" = "YSV",
+                              "Predominant_land_usePlantation" = "Plantation",
+                              "Predominant_land_usePasture" = "Pasture",
+                              "Predominant_land_useCropland" = "Cropland")
+
+# Add in upper and lower confidence intervals 
+db_eff_sqrt_ab <- db_eff_sqrt_ab %>%
+  mutate(Upper_ci = (median + 1.96*sd)) %>%
+  mutate(Lower_ci = (median - 1.96*sd))
+
+# Back transform the sqrt abundance estimates so that I get a measure of abundance
+db_eff_sqrt_ab <- db_eff_sqrt_ab %>%
+  mutate(
+    Percent_diff = ((((median[1] + median)^2) / (median[1])^2)*100)-100) %>%
+  mutate(
+    Percent_upper = (((median[1] + Upper_ci)^2) / ((median[1])^2) * 100) - 100) %>%
+  mutate(
+    Percent_lower = ((((median[1] + Lower_ci)^2) / ((median[1])^2) * 100) - 100)
+  )
+
+# Shift the baseline down to 0
+db_eff_sqrt_ab[1,7] <- 0 #shift median
+db_eff_sqrt_ab[1,8] <- 0 #shift upper
+db_eff_sqrt_ab[1,9] <- 0 #shift lower 
+
+# Rename the sim eff term column name to LUI for joining
+colnames(db_eff_sqrt_ab)[1] <- "Predominant_land_use"
+```
+
+### Create the ant effects dataframe
+```{r}
+# gather the effects and confidence intervals using simulation. Simulate 10000 times
+ant_eff_sqrt_ab <- FEsim(m1a, 1000)
+
+# make the term column a factor so it can be recoded
+ant_eff_sqrt_ab$term <- as.factor(ant_eff_sqrt_ab$term)
+
+# Pull out only ant terms
+ant_eff_sqrt_ab <- ant_eff_sqrt_ab %>%
+  slice(1:7)
+
+# recode the factors to make them shorter (so I can visualise easier)
+ant_eff_sqrt_ab$term <- recode_factor(ant_eff_sqrt_ab$term, "(Intercept)" = "Primary",
+                              "Predominant_land_useMSV" = "MSV",
+                              "Predominant_land_useISV" = "ISV",
+                              "Predominant_land_useYSV" = "YSV",
+                              "Predominant_land_usePlantation" = "Plantation",
+                              "Predominant_land_usePasture" = "Pasture",
+                              "Predominant_land_useCropland" = "Cropland")
+
+# Add in upper and lower confidence intervals 
+ant_eff_sqrt_ab <- ant_eff_sqrt_ab %>%
+  mutate(Upper_ci = (median + 1.96*sd)) %>%
+  mutate(Lower_ci = (median - 1.96*sd))
+
+# Back transform the sqrt abundance estimates so that I get a measure of abundance
+ant_eff_sqrt_ab <- ant_eff_sqrt_ab %>%
+  mutate(
+    Percent_diff = ((((median[1] + median)^2) / (median[1])^2)*100)-100) %>%
+  mutate(
+    Percent_upper = (((median[1] + Upper_ci)^2) / ((median[1])^2) * 100) - 100) %>%
+  mutate(
+    Percent_lower = ((((median[1] + Lower_ci)^2) / ((median[1])^2) * 100) - 100)
+  )
+
+# Shift the baseline down to 0
+ant_eff_sqrt_ab[1,7] <- 0 #shift median
+ant_eff_sqrt_ab[1,8] <- 0 #shift upper
+ant_eff_sqrt_ab[1,9] <- 0 #shift lower 
+
+# Rename the sim eff term column name to LUI for joining
+colnames(ant_eff_sqrt_ab)[1] <- "Predominant_land_use"
+```
+
+### Combine the dataframes together
+Add in a column of "Family_combined" to make sure there is a grouping variable
+```{r}
+comb_sqrt_ab <- rbind(db_eff_sqrt_ab, ant_eff_sqrt_ab)
+comb_sqrt_ab$Family_combined <- c("Dung beetles", "Dung beetles", "Dung beetles", "Dung beetles", "Dung beetles", "Dung beetles", "Dung beetles","Ants", "Ants", "Ants", "Ants", "Ants", "Ants", "Ants")
+```
+
+### Finally, plot the combined effect estimates
+```{r}
+## Plot the effect estimate as the percent species richness difference from primary vegetation
+abundance <- comb_sqrt_ab %>%
+  ggplot()+
+  aes(x = Predominant_land_use, y = Percent_diff, colour = Family_combined)+
+  geom_hline(yintercept = 0, size = 0.5, color = ("black"), linetype = 1)+
+  geom_point(size = 3, position = position_dodge(width = 0.5))+
+  geom_linerange(aes(ymin = Percent_lower, ymax = Percent_upper), position = position_dodge(width = 0.5), size = 1)+
+  theme_classic()+
+  scale_x_discrete(limits=comb_plot_limits)+
+  geom_vline(xintercept = 1.5, linetype = 2)+
+  geom_vline(xintercept = 2.5, linetype = 2)+
+  geom_vline(xintercept = 3.5, linetype = 2)+
+  geom_vline(xintercept = 4.5, linetype = 2)+
+  geom_vline(xintercept = 5.5, linetype = 2)+
+  geom_vline(xintercept = 6.5, linetype = 2)+
+  theme(axis.text.x = element_text(face= "bold", angle = 45, hjust = 1),
+        axis.title.x = element_blank(),
+        axis.title.y = element_text(face = "bold"),
+        legend.position = "none",
+        panel.border = element_rect(colour = "black",  fill=NA))+
+  xlab("Land use intensity class")+
+  ylab("Total abundance difference (%)")+
+  scale_colour_manual(legend_title, values = color)
+abundance
+```
+Figure X: Linear mixed effects model showing total abundance difference from primary vegetation. Error bars show the 95% confidence interval around each estimate. Error bars that do not cross zero are statistically significantly different from the baseline (primary vegetation). Line colors represent the following taxonomic groups: teal (Ants), red (Dung beetles). X-axis colors represent the following land-use types: black (primary vegetation, Primary), orange (mature secondary vegetation, MSV), light blue (intermediate secondary vegetation, ISV), green (young secondary vegetation, YSV), yellow (plantation forest, Plantation), dark blue (Pasture), dark orange (Cropland). N = 1816 observations
+
+### Make the legend
+```{r}
+### Make a new plot, extract just the legend from it,so I can combine with my other nicer plots
+comb_legend_1 <- ggplot(model_data_comb_sr, aes(x = Predominant_land_use, fill = Family_combined)) + 
+  scale_fill_manual(labels = c("Ants", "Dung beetles"), values=color)+
+  guides(fill=guide_legend(title = "Taxonomic group", title.position = "top", nrow=1, byrow=TRUE))+
+  theme(legend.position = "bottom",
+        legend.text = element_text( face = "bold", size = 8),
+        legend.title = element_text(face = "bold"))+
+  geom_bar()
+comb_legend_1
+
+# Using the cowplot package
+comb_legend_2 <- cowplot::get_legend(comb_legend_1)
+comb_plot_legend <- as_ggplot(comb_legend_2)
+comb_plot_legend
+```
+
+### Export the graphs
+```{r}
+combined_diversity_plots_1 <- ggarrange(abundance, species_richness,
+                    labels = c("A", "B"),
+                    ncol = 1, nrow = 2)
+combined_diversity_plots_2 <- ggarrange(abundance, comb_plot_legend,
+                                        labels = c("", ""),
+                                        ncol = 1, nrow = 2)
+combined_diversity_plots_2
+ggexport(combined_diversity_plots_1, filename = "combined_diversity_plots_1.pdf")
+ggexport(combined_diversity_plots_2, filename = "combined_diversity_plots_2.pdf")
+```

@@ -1,0 +1,1455 @@
+---
+title: "4c_Ant_Nine_Guild_Model"
+author: "Alex Dhond"
+date: "8/3/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+In this document I will load in the excel file with the 9 trophic guilds based on Groc et al 2014. I will then model the species richness of the 9 guild model. WARNING: some of the interaction models in here take a long time to run  
+
+### For clearing the workspace prior to running
+```{r}
+rm(list=ls())
+```
+
+### Load required packages
+```{r}
+## Data manipulation ## 
+library(dplyr) # data manipulation
+library(tidyr) # data manipulation
+
+## Modelling ## 
+library(lme4) # creating mixed effects models
+library(car) # for LRT / anova comparisons
+library(merTools) # for extracting model estimates
+library(MuMIn) # for assessing model fit
+library(optimx) #optimizing models
+library(DHARMa) #for model validation
+
+## Plotting ## 
+library(ggplot2) # basic plotting package
+library(ggpubr) # for arranging and exporting plots
+library(cowplot) # for arranging and exporting plots
+```
+
+### Load in any required functions
+```{r}
+## Load in the source function for checking GVIFs - for collinearity
+source("https://highstat.com/Books/Book2/HighstatLibV10.R")
+
+## Load in a model criticism function - this function is used for checking the residual/model diagnostic plots to test that the model is meeting all of its assumptions
+model_plot <-function(mod.for.plot){
+  require(lattice)
+  
+   # set up a 2 x 2 grid for plotting
+  par(mfrow = c(1,3))
+  par(ask = TRUE) 
+  
+  # qqplot
+  qqnorm(resid(mod.for.plot))
+  qqline(resid(mod.for.plot), col = 2)
+  
+  # residuals vs fitted plot
+  plot(fitted(mod.for.plot), resid(mod.for.plot),xlab = "Fitted Values", ylab = "Residuals", main = "Residuals vs fitted")
+  abline(h=0, lty=2)
+  lines(smooth.spline(fitted(mod.for.plot), resid(mod.for.plot)), col = "red")
+  
+  # histogram of residuals
+  hist(resid(mod.for.plot))
+  
+  # random effects distribution
+  dotplot(ranef(mod.for.plot,condVar = TRUE))
+}
+
+## Load in an overdispersion function from this website to help test if the models are overdispersed.
+# https://bbolker.github.io/mixedmodels-misc/glmmFAQ.html#testing-for-overdispersioncomputing-overdispersion-factor
+overdisp_fun <- function(model) {
+    rdf <- df.residual(model)
+    rp <- residuals(model,type="pearson")
+    Pearson.chisq <- sum(rp^2)
+    prat <- Pearson.chisq/rdf
+    pval <- pchisq(Pearson.chisq, df=rdf, lower.tail=FALSE)
+    c(chisq=Pearson.chisq,ratio=prat,rdf=rdf,p=pval)
+}
+```
+
+### Read in the excel file and tidy it up
+```{r}
+#read in file
+ant_guilds_9 <- read_xlsx("Ant_species.xlsx")
+
+#convert NAs to 0s
+ant_guilds_9[is.na(ant_guilds_9)] <- 0
+
+#remove column 1 as well as the last three columns (the more general classification) so I only have the 9 tier classification
+ant_guilds_9 <- ant_guilds_9[, -c(1, 12:15)]
+```
+
+### Create a new dataframe in which Guild becomes its own column
+```{r}
+## pivot longer new dataframe
+ant_guilds_9_long <- ant_guilds_9 %>% 
+  pivot_longer(!GenusSpecies, names_to = "Guild", values_to = "count")
+
+## get rid of rows where it is 0
+ant_guilds_9_long <- droplevels(subset(ant_guilds_9_long, count !=0))
+
+## get rid of count
+ant_guilds_9_long <- ant_guilds_9_long[, -3]
+
+## I should now be able to left join this to the Ants dataset by GenusSpecies
+```
+
+# Join the ant guilds into the larger ant dataset
+
+### Read in the ants data set, make a new column GenusSpecies
+```{r}
+#read in the data
+NeoAnts <- read.csv("NeoAnts.csv")
+
+# create GenusSpecies column
+NeoAnts <- NeoAnts %>%
+  mutate(GenusSpecies = ifelse(Best_guess_binomial == "", paste(Genus), paste(Best_guess_binomial)))
+```
+
+### Left join the two datasets
+```{r}
+## join the set where guild is only a column
+Ants_9_long <- left_join(NeoAnts, ant_guilds_9_long)
+```
+
+### Create the sites where guild is also kept separately
+```{r}
+NeoAntSites_Guild9 <- Ants_9_long %>%
+
+  # pull out only the merged diversity data
+  distinct(merge_ID, .keep_all = TRUE) %>%
+  
+  # re-make SSB and SSBS values since we've now dropped a bunch of values
+  mutate(SS = paste(Source_ID, Study_number),
+         SSB = paste(SS, Block),
+         SSBS = paste(SSB, Site_number)) %>%
+  
+  # group by SSBS (each unique value corresponds to a unique site)
+  group_by(SSBS, Guild) %>%
+  
+  # now add up all the abundance measurements within each site
+  mutate(TotalAbundance = ifelse(Diversity_metric_type == "Abundance",
+                                 sum(merged_diversity),
+                                 # if the diversity metric type isn't Abundance, then leave the TotalAbundance measurement as NA
+                                 NA),
+         
+         # if the metric is already species richness
+         SpeciesRichness = ifelse(Diversity_metric_type == "Species richness",
+                                  # just use the value as given
+                                  merged_diversity,
+                                  # for abundance and occurrence measurements, count the number of unique species names that are present at the site 
+                                  n_distinct(Taxon_name_entered[merged_diversity > 0])),
+         
+         # calculate Chao's Species Richness Estimator
+         # if the diversity metric is suitable for this calculation
+         ChaoRichness = ifelse(Diversity_metric_is_suitable_for_Chao == TRUE,
+                               # calculate the Chao estimator
+                               sum(merged_diversity > 0) + (((sum(merged_diversity == 1) * (sum(merged_diversity == 1)-1)) / (2*(sum(merged_diversity == 2)+1)))),
+                               # otherwise give Chao NA
+                               NA)
+         ) %>%
+  
+  # ungroup
+  ungroup() %>%
+  
+    # now group by Study ID
+  group_by(SS, Guild) %>%
+  
+  # pull out some useful study-level numbers
+  # maximum abundance for each study
+  mutate(MaxAbundance = max(TotalAbundance),
+         # number of species in the study
+         SpeciesInStudy = n_distinct(Taxon_name_entered[merged_diversity > 0]),
+         # assess whether the study is suitable for rarefaction
+         SuitableForRarefaction = ifelse(
+           # if all diversity measurements are integers
+           # i.e. if you round down, it should be equal to the original number
+           # and the diversity metric is suitable for Chao
+           all(floor(merged_diversity) == merged_diversity) &
+             Diversity_metric_is_suitable_for_Chao == TRUE,
+           # then class the study as suitable for rarefaction
+           TRUE,
+           # otherwise it can't be used
+           FALSE
+           )
+         ) %>%
+  
+  # ungroup
+  ungroup()  %>%
+  
+  # now rescale total abundance, so that within each study, abundance varies from 0 to 1.
+  mutate(RescaledAbundance = TotalAbundance/MaxAbundance,
+         # for statistical modelling, we'll also calculate the square root of species abundance, although we might want to use log(x+1) transformation instead
+         sqrtRescaledAbundance = sqrt(RescaledAbundance),
+         logRescaledAbundance = log(RescaledAbundance + 1)
+         )
+
+# pull out unique sites
+NeoAntSites_Guild9 <- NeoAntSites_Guild9 %>%
+  distinct(SSBS, Guild, .keep_all = TRUE)
+```
+
+### collapse land use categories together (these should be the same categories as script 4 - ant site diversity)
+```{r}
+NeoAntSites_Guild9 <- NeoAntSites_Guild9 %>%
+  
+  mutate(
+
+     # collapse primary forest and non-forest together into primary vegetation as these aren't well distinguished
+    Predominant_land_use = recode_factor(Predominant_land_use, 
+                                  "Primary forest" = "Primary vegetation", 
+                                  "Primary non-forest" = "Primary vegetation"),
+    
+    # indeterminate secondary veg and cannot decide get NA
+    Predominant_land_use = na_if(Predominant_land_use, "Secondary vegetation (indeterminate age)"),
+    Predominant_land_use = na_if(Predominant_land_use, "Cannot decide"),
+    Use_intensity = na_if(Use_intensity, "Cannot decide"),
+)
+
+NeoAntSites_Guild9 <- droplevels(subset(NeoAntSites_Guild9, Predominant_land_use != "Urban"))
+
+# take another look at the LandUse/Use intensity split
+table(NeoAntSites_Guild9$Predominant_land_use, NeoAntSites_Guild9$Use_intensity) 
+```
+
+### Create LUI as a new factor that combines Land use and use intensity
+```{r}
+NeoAntSites_Guild9 <- NeoAntSites_Guild9 %>%
+  mutate(LUI = interaction(Predominant_land_use, Use_intensity, sep = "_"),
+         
+         # collapse Primary vegetation into one category
+         LUI = recode_factor(LUI, "Primary vegetation_Minimal use" = "Primary vegetation", "Primary vegetation_Light use" = "Primary vegetation", "Primary vegetation_Intense use" = "Primary vegetation"),
+         
+         #collapse young secondary together
+         LUI = recode_factor(LUI, "Young secondary vegetation_Intense use" = "Young secondary vegetation_LightIntense", 
+                             "Young secondary vegetation_Light use" = "Young secondary vegetation_LightIntense"),
+         
+         #collapse Cropland Itogether"
+         LUI = recode_factor(LUI, "Cropland_Intense use" = "Cropland",
+                             "Cropland_Light use" = "Cropland",
+                             "Cropland_Minimal use" = "Cropland"),
+         
+         #collapse plantation forest intense and light together
+         LUI = recode_factor(LUI, "Plantation forest_Intense use" = "Plantation forest_LightIntense",
+                             "Plantation forest_Light use" = "Plantation forest_LightIntense"),
+         
+         #collapse Intermediate secondary vegetation light and intense together
+         LUI = recode_factor(LUI, "Intermediate secondary vegetation_Intense use" = "Intermediate secondary vegetation_LightIntense", "Intermediate secondary vegetation_Light use" = "Intermediate secondary vegetation_LightIntense"),
+         
+         #collapse Pasture into light and intense
+         LUI = recode_factor(LUI, "Pasture_Light use" = "Pasture",
+                             "Pasture_Intense use" = "Pasture",
+                             "Pasture_Minimal use" = "Pasture"),
+        
+  )
+
+#remove the categories with no data
+NeoAntSites_Guild9 <- droplevels(subset(NeoAntSites_Guild9, LUI != "Mature secondary vegetation_Light use" | LUI != "Mature secondary vegetation_Intense use"))
+
+#check to see it has worked
+table(NeoAntSites_Guild9$LUI)
+```
+
+### Recode the names of the LUI categories to make them shorter
+Here, I am making the "LightIntense" category "Higher (H)"
+```{r}
+#LightIntense use category will be classified as "Higher (H)" use for brevity
+NeoAntSites_Guild9<- NeoAntSites_Guild9%>%
+  mutate(LUI = plyr::revalue(LUI, c("Primary vegetation" = "PV",
+                                    "Mature secondary vegetation_Minimal use" = "MSV", #since there is only this category now, no other intensities
+                                    "Intermediate secondary vegetation_Minimal use" = "ISVMU",
+                                    "Intermediate secondary vegetation_LightIntense" = "ISVHU",
+                                    "Young secondary vegetation_Minimal use" = "YSVMU",
+                                    "Young secondary vegetation_LightIntense" = "YSVHU",
+                                    "Plantation forest_Minimal use" = "PFMU",
+                                    "Plantation forest_LightIntense" = "PFHU",
+                                    "Pasture" = "P",
+                                    "Cropland" = "C"
+                                    )))
+```
+
+### reorder the factor levels
+```{r}
+#first get a list of the levels
+levels(NeoAntSites_Guild9$LUI)
+
+#recode the levels
+NeoAntSites_Guild9$LUI <- factor(NeoAntSites_Guild9$LUI, levels = c("PV", "MSV", "ISVMU", "ISVHU", "YSVMU", "YSVHU", "PFMU", "PFHU", "P", "C"))
+
+#check it worked
+levels(NeoAntSites_Guild9$LUI)
+```
+
+
+### Create a model dataframe for the sites
+```{r}
+model_ant_ab <- drop_na(NeoAntSites_Guild9,
+                             RescaledAbundance, Predominant_land_use, Use_intensity, LUI, Guild)
+#ant log and sqrt abundances
+model_ant_ab <- mutate(model_ant_ab, 
+                        logAbundance = log(RescaledAbundance + 1),
+                        sqrtAbundance = sqrt(RescaledAbundance))
+  
+model_ant_sr <- drop_na(NeoAntSites_Guild9,
+                        SpeciesRichness, Predominant_land_use, Use_intensity, LUI, Guild)
+```
+
+### Reorder the factor levels for the model ant datasets
+Reorder the levels so that visualisation is more clear
+```{r}
+### ANTS
+
+#abundance
+
+    #reorder abundance LUI levels
+    model_ant_ab$LUI <- factor(model_ant_ab$LUI, levels = c("PV", "MSV", "ISVMU", "ISVHU", "YSVMU", "YSVHU", "PFMU", "PFHU", "P", "C"))
+
+    #reorder abundance Predominant land use levels
+    model_ant_ab$Predominant_land_use <- factor(model_ant_ab$Predominant_land_use, levels = c("Primary vegetation", "Mature secondary vegetation", "Intermediate secondary vegetation", "Young secondary vegetation", "Plantation forest", "Pasture", "Cropland"))
+
+    #reorder abundance Use intensity levels
+    model_ant_ab$Use_intensity <- factor(model_ant_ab$Use_intensity, levels = c("Minimal use", "Light use", "Intense use"))
+
+
+#species richness
+
+    #reorder Species richness LUI levels
+    model_ant_sr$LUI <- factor(model_ant_sr$LUI, levels = c("PV", "MSV", "ISVMU", "ISVHU", "YSVMU", "YSVHU", "PFMU", "PFHU", "P", "C"))
+
+    #reorder Species richness Predominant land use levels
+    model_ant_sr$Predominant_land_use <- factor(model_ant_sr$Predominant_land_use, levels = c("Primary vegetation", "Mature secondary vegetation", "Intermediate secondary vegetation", "Young secondary vegetation", "Plantation forest", "Pasture", "Cropland"))
+
+    #reorder Species richness Use intensity levels
+    model_ant_sr$Use_intensity <- factor(model_ant_sr$Use_intensity, levels = c("Minimal use", "Light use", "Intense use"))
+```
+
+### Look at the data spread
+```{r}
+table(model_ant_sr$LUI)
+table(model_ant_sr$Predominant_land_use, model_ant_sr$Use_intensity)
+```
+
+### Clean up the guilds 
+```{r}
+## check structure of the data
+str(model_ant_sr$Guild)
+levels(model_ant_sr$Guild)
+## make it a factor
+model_ant_sr$Guild <- as.factor(model_ant_sr$Guild)
+
+## look at the data spread
+table(model_ant_sr$Guild, model_ant_sr$Predominant_land_use)
+```
+
+### First check for collinearity between the predictor variables
+I don't expect there to be any collinearity between LUI and guild, but I will check anyway
+```{r}
+## Test for collinearity between LUI and guild
+corvif(model_ant_sr[ , c("LUI", "Guild")])
+
+## Test for collinearity between predominant land use and guild
+corvif(model_ant_sr[ , c("Predominant_land_use", "Guild")])
+```
+
+### Create species richness models
+### Create the maximal model and proceed with backwards stepwise selection
+```{r}
+## Create the maximal model. optimizer used due to convergence warnings
+model1 <- glmer(SpeciesRichness ~ LUI*Guild + (1|SS) + (1|SSB), 
+            data = model_ant_sr,
+            family = "poisson",
+            control = glmerControl("optimx", optCtrl=list(method="nlminb")))
+
+## Remove block as random effect. optimizer used due to convergence warnings
+model2 <- glmer(SpeciesRichness ~ LUI*Guild + (1|SS), 
+            data = model_ant_sr,
+            family = "poisson",
+            control = glmerControl("optimx", optCtrl=list(method="nlminb")))
+
+## Remove study as random effect. optimizer used due to convergence warnings
+model3 <- glmer(SpeciesRichness ~ LUI*Guild + (1|SSB), 
+            data = model_ant_sr,
+            family = "poisson",
+            control = glmerControl("optimx", optCtrl=list(method="nlminb")))
+
+## Compare the random effects structure of the model
+AIC(model1, model2, model3)
+anova(model1, model2, model3)
+
+## Model1 is the best random effect structure, so keep that.
+
+## Compare the first model to an additive model
+model4 <- glmer(SpeciesRichness ~ LUI + Guild + (1|SS) + (1|SSB), 
+            data = model_ant_sr,
+            family = "poisson",
+            control = glmerControl("optimx", optCtrl=list(method="nlminb")))
+
+## remove guild
+model5 <- glmer(SpeciesRichness ~ LUI + (1|SS) + (1|SSB), 
+            data = model_ant_sr,
+            family = "poisson",
+            control = glmerControl("optimx", optCtrl=list(method="nlminb")))
+
+## remove LUI
+model6 <- glmer(SpeciesRichness ~ Guild + (1|SS) + (1|SSB), 
+            data = model_ant_sr,
+            family = "poisson",
+            control = glmerControl("optimx", optCtrl=list(method="nlminb")))
+
+## create also a null model
+model7 <- glmer(SpeciesRichness ~ (1|SS) + (1|SSB), 
+            data = model_ant_sr,
+            family = "poisson")
+
+## Check which model fits better
+anova(model1, model4, model5, model6, model7)
+model.sel(model1, model4, model5, model6, model7)
+anova(model1, model6)
+anova(model1,model4)
+anova(model4, model8a)
+```
+
+So for this 9 guild classification, model1 seems to be the best. Now time to check out the model diagnostics
+### Check model diagnostic plots
+```{r}
+## run the model function
+model_plot(model1)
+
+## Simulate the residuals of the model using DHARMa
+model1residuals <- simulateResiduals(fittedModel = model1, plot = F)
+
+## Plot them
+plot(model1residuals)
+
+## Test the outliers and test for dispersion
+testOutliers(model1residuals)
+testDispersion(model1residuals)
+
+## Test for overdispersion
+overdisp_fun(model1)
+```
+
+Evidently the model is overdispersed. Add in a site level random effect to account for some of this overdispersion
+### Add in site level random effect for overdispersion
+```{r}
+## In case of overdispersion, add in a row-level random effect
+model_ant_sr$Row_random_effect <- 1:nrow(model_ant_sr)
+
+## Add each row (essentially site) as a random effect
+model8 <- glmer(SpeciesRichness ~ LUI*Guild + (1|SS) + (1|SSB) + (1|Row_random_effect), 
+            data = model_ant_sr,
+            family = "poisson",
+            control = glmerControl("optimx", optCtrl=list(method="nlminb")))
+
+## Check for overdispersion
+overdisp_fun(model8)
+summary(model8)
+```
+
+Model8 fixed the overdispersion, but the model itself did not converge. I will try to use some different optimizers and increase the iterations to see if I can get convergence
+
+### Test a few different optimizers
+```{r}
+## Use bobyqa, increase iterations
+model8a <- glmer(SpeciesRichness ~ LUI*Guild + (1|SS) + (1|SSB) + (1|Row_random_effect), 
+            data = model_ant_sr,
+            family = "poisson",
+            control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxit = 1e9,
+                                                                        maxfun = 1e9,
+                                                                        xtol_abs = 1e-11,
+                                                                        ftol_abs = 1e-11,
+                                                                        maxeval = 1e9)))
+
+## Use nloptwrap, increase iterations
+model8b <- glmer(SpeciesRichness ~ LUI*Guild + (1|SS) + (1|SSB) + (1|Row_random_effect), 
+            data = model_ant_sr,
+            family = "poisson",
+            control = glmerControl("nloptwrap", optCtrl = list(algorithm = "NLOPT_LN_BOBYQA",
+                                                               maxit = 1e9,
+                                                               maxfun = 1e9,
+                                                               xtol_abs = 1e-11,
+                                                               ftol_abs = 1e-11,
+                                                               maxeval = 1e9)))
+
+## Use optimx, but increase iterations
+model8c <- glmer(SpeciesRichness ~ LUI*Guild + (1|SS) + (1|SSB) + (1|Row_random_effect), 
+            data = model_ant_sr,
+            family = "poisson",
+            control = glmerControl("optimx", optCtrl=list(method="nlminb",
+                                                          maxit = 1e9,
+                                                          maxfun = 1e9,
+                                                          xtol_abs = 1e-11,
+                                                          ftol_abs = 1e-11,
+                                                          maxeval = 1e9)))
+```
+
+So both model8a and model8c converged, but model8b did not. 
+```{r}
+Anova(model8a)
+```
+
+### Check model diagnostic plots for model8a
+```{r}
+## run the model function
+model_plot(model8a)
+
+## Simulate the residuals of the model using DHARMa
+model8aresiduals <- simulateResiduals(fittedModel = model8a, plot = F)
+
+## Plot them
+plot(model8aresiduals)
+
+## Test the outliers and test for dispersion
+testOutliers(model8aresiduals)
+testDispersion(model8aresiduals)
+```
+
+### Add in SSBS as a random effect to see if there is any difference
+```{r}
+## Add SSBS as a random effect
+model9 <- glmer(SpeciesRichness ~ LUI*Guild + (1|SS) + (1|SSB) + (1|SSBS), 
+            data = model_ant_sr,
+            family = "poisson",
+            control = glmerControl("optimx", optCtrl=list(method="nlminb")))
+overdisp_fun(model9)
+summary(model9)
+```
+
+Model9 is still overdispersed, whereas model8a is not. 
+### Add in a row random effect as well as SSBS
+```{r}
+## Add each row (essentially site) as a random effect
+model10 <- glmer(SpeciesRichness ~ LUI*Guild + (1|SS) + (1|SSB) + (1|SSBS) + (1|Row_random_effect), 
+            data = model_ant_sr,
+            family = "poisson",
+            control = glmerControl("optimx", optCtrl=list(method="nlminb")))
+```
+
+Model10 was singular and did not converge, so that means that either model 8a or 8c are the best for LUI vs species richness. I will use model 8a.
+
+### Create models for SR vs Land use
+### Create the maximal model and proceed with backwards stepwise selection
+```{r}
+## Create the maximal model. optimizer used due to convergence warnings
+model11 <- glmer(SpeciesRichness ~ Predominant_land_use*Guild + (1|SS) + (1|SSB), 
+            data = model_ant_sr,
+            family = "poisson",
+            control = glmerControl("optimx", optCtrl=list(method="nlminb")))
+
+## Remove block as random effect. optimizer used due to convergence warnings
+model12 <- glmer(SpeciesRichness ~ Predominant_land_use*Guild + (1|SS), 
+            data = model_ant_sr,
+            family = "poisson",
+            control = glmerControl("optimx", optCtrl=list(method="nlminb")))
+
+## Remove study as random effect. optimizer used due to convergence warnings
+model13 <- glmer(SpeciesRichness ~ Predominant_land_use*Guild + (1|SSB), 
+            data = model_ant_sr,
+            family = "poisson",
+            control = glmerControl("optimx", optCtrl=list(method="nlminb")))
+
+## Check the random effects structure
+AIC(model11, model12, model13)
+model.sel(model11, model12, model13)
+
+## Model11 is the best random effect structure, so keep that.
+
+## Compare the first model to an intercept only model of Species richness
+model14 <- glmer(SpeciesRichness ~ (1|SS) + (1|SSB), 
+            data = model_ant_sr,
+            family = "poisson")
+
+## compare the null model to the fixed effects model
+anova(model11, model14)
+
+## might be overdispersion so add in effect of row 
+model15 <- glmer(SpeciesRichness ~ Predominant_land_use*Guild + (1|SS) + (1|SSB) + (1|Row_random_effect), 
+            data = model_ant_sr,
+            family = "poisson",
+            control = glmerControl("optimx", optCtrl=list(method="nlminb")))
+
+## add in SSBS as extra random effect
+model16 <- glmer(SpeciesRichness ~ Predominant_land_use*Guild + (1|SS) + (1|SSB) + (1|SSBS), 
+            data = model_ant_sr,
+            family = "poisson",
+            control = glmerControl("optimx", optCtrl=list(method="nlminb")))
+overdisp_fun(model16)
+```
+
+Model15 did not converge the first time, and model16 is still overdispersed. I will now re-run model15 with different optimizers to see if I can get convergence
+
+### Re-run model 15 with different optimizers
+```{r}
+## Use bobyqa and increase iterations
+model15a <- glmer(SpeciesRichness ~ Predominant_land_use*Guild + (1|SS) + (1|SSB) + (1|Row_random_effect), 
+            data = model_ant_sr,
+            family = "poisson",
+            control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxit = 1e9,
+                                                                        maxfun = 1e9,
+                                                                        xtol_abs = 1e-11,
+                                                                        ftol_abs = 1e-11,
+                                                                        maxeval = 1e9)))
+
+## Use optimx and increase iterations
+model15b <- glmer(SpeciesRichness ~ Predominant_land_use*Guild + (1|SS) + (1|SSB) + (1|Row_random_effect), 
+            data = model_ant_sr,
+            family = "poisson",
+            control = glmerControl("optimx", optCtrl=list(method="nlminb",
+                                                          maxit = 1e9,
+                                                          maxfun = 1e9,
+                                                          xtol_abs = 1e-11,
+                                                          ftol_abs = 1e-11,
+                                                          maxeval = 1e9)))
+
+## use nloptwrap and increase iterations
+model15c <- glmer(SpeciesRichness ~ Predominant_land_use*Guild + (1|SS) + (1|SSB) + (1|Row_random_effect), 
+            data = model_ant_sr,
+            family = "poisson",
+            control = glmerControl("nloptwrap", optCtrl = list(algorithm = "NLOPT_LN_BOBYQA",
+                                                               maxit = 1e9,
+                                                               maxfun = 1e9,
+                                                               xtol_abs = 1e-11,
+                                                               ftol_abs = 1e-11,
+                                                               maxeval = 1e9)))
+```
+
+Only model 15a converged, so now I can compare that to the LUI model
+
+### Compare LUI vs predominant land use model to see which explains the data better
+```{r}
+## use anova to compare models
+anova(model15a, model8a)
+```
+
+As expected, LUI is more significant and explains more. So keep model 8a.
+
+Before I move on, save the model diagnostic plots for the appendix
+
+### Save the model diagnostic plots
+```{r}
+model_plot(model8a)
+
+pdf("ant_9_tier_model_diagnostic_plots.pdf")
+
+model_plot(model8a)
+
+dev.off()
+```
+
+### Create multiple models with different reference categories
+```{r}
+## In this model, arboreal omnivore is the reference level - I need to make 8 more models with different reference categories
+
+model_ant_sr_1_AP <- within(model_ant_sr, Guild <- relevel(Guild, ref = "Arboreal predators"))
+model_ant_sr_2_CA <- within(model_ant_sr, Guild <- relevel(Guild, ref = "Cryptobiotic attines"))
+model_ant_sr_3_GO <- within(model_ant_sr, Guild <- relevel(Guild, ref = "Generalist omnivores"))
+model_ant_sr_4_GDGP <- within(model_ant_sr, Guild <- relevel(Guild, ref = "Ground-dwelling generalist predators"))
+model_ant_sr_5_GDSP <- within(model_ant_sr, Guild <- relevel(Guild, ref = "Ground-dwelling specialist predators"))
+model_ant_sr_6_LC <- within(model_ant_sr, Guild <- relevel(Guild, ref = "Leaf-cutters"))
+model_ant_sr_7_RHP <- within(model_ant_sr, Guild <- relevel(Guild, ref = "Raid-hunting predators"))
+model_ant_sr_8_GDO <- within(model_ant_sr, Guild <- relevel(Guild, ref = "Ground-dwelling omnivores"))
+
+## Create arboreal predator dataframe and model
+model8a_AP <- glmer(SpeciesRichness ~ LUI*Guild + (1|SS) + (1|SSB), data = model_ant_sr_1_AP,
+            family = "poisson",
+            control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxit = 1e9,
+                                                                        maxfun = 1e9,
+                                                                        xtol_abs = 1e-11,
+                                                                        ftol_abs = 1e-11,
+                                                                        maxeval = 1e9)))
+
+## Create cryptobiotic attines reference and make model
+model8a_CA <- glmer(SpeciesRichness ~ LUI*Guild + (1|SS) + (1|SSB), data = model_ant_sr_2_CA,
+            family = "poisson",
+            control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxit = 1e9,
+                                                                        maxfun = 1e9,
+                                                                        xtol_abs = 1e-11,
+                                                                        ftol_abs = 1e-11,
+                                                                        maxeval = 1e9)))
+
+## Make generalist omnivores as level and model
+model8a_GO <- glmer(SpeciesRichness ~ LUI*Guild + (1|SS) + (1|SSB), data = model_ant_sr_3_GO,
+            family = "poisson",
+            control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxit = 1e9,
+                                                                        maxfun = 1e9,
+                                                                        xtol_abs = 1e-11,
+                                                                        ftol_abs = 1e-11,
+                                                                        maxeval = 1e9)))
+
+## Make Ground-dwelling generalist predators as reference and model
+model8a_GDGP <- glmer(SpeciesRichness ~ LUI*Guild + (1|SS) + (1|SSB), data = model_ant_sr_4_GDGP,
+            family = "poisson",
+            control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxit = 1e9,
+                                                                        maxfun = 1e9,
+                                                                        xtol_abs = 1e-11,
+                                                                        ftol_abs = 1e-11,
+                                                                        maxeval = 1e9)))
+
+## Make Ground-dwelling specialist predators as reference and model
+model8a_GDSP <- glmer(SpeciesRichness ~ LUI*Guild + (1|SS) + (1|SSB), data = model_ant_sr_5_GDSP,
+            family = "poisson",
+            control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxit = 1e9,
+                                                                        maxfun = 1e9,
+                                                                        xtol_abs = 1e-11,
+                                                                        ftol_abs = 1e-11,
+                                                                        maxeval = 1e9)))
+
+## Make Leaf-cutters as reference and model
+model8a_LC <- glmer(SpeciesRichness ~ LUI*Guild + (1|SS) + (1|SSB), data = model_ant_sr_6_LC,
+            family = "poisson",
+            control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxit = 1e9,
+                                                                        maxfun = 1e9,
+                                                                        xtol_abs = 1e-11,
+                                                                        ftol_abs = 1e-11,
+                                                                        maxeval = 1e9)))
+
+## Make Raid-hunting predators as reference and model
+model8a_RHP <- glmer(SpeciesRichness ~ LUI*Guild + (1|SS) + (1|SSB), data = model_ant_sr_7_RHP,
+            family = "poisson",
+            control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxit = 1e9,
+                                                                        maxfun = 1e9,
+                                                                        xtol_abs = 1e-11,
+                                                                        ftol_abs = 1e-11,
+                                                                        maxeval = 1e9)))
+
+## Make Ground-dwelling omnivores as reference and model
+model8a_GDO <- glmer(SpeciesRichness ~ LUI*Guild + (1|SS) + (1|SSB), data = model_ant_sr_8_GDO,
+            family = "poisson",
+            control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxit = 1e9,
+                                                                        maxfun = 1e9,
+                                                                        xtol_abs = 1e-11,
+                                                                        ftol_abs = 1e-11,
+                                                                        maxeval = 1e9)))
+```
+
+Now that all the models are done, its time to simulate the effects and calculate. I need to simulate the effects for all 9 trophic guilds.
+
+### Simulate the effects of model8a (group 1 - where arboreal omnivores are the baseline)
+```{r}
+# gather the effects and confidence intervals using simulation. Simulate 1000 times
+eff_AO <- FEsim(model8a, 1000)
+
+# make the term column a factor so it can be recoded
+eff_AO$term <- as.factor(eff_AO$term)
+
+## slice only the relevant effects (not interaction terms)
+eff_AO <- eff_AO %>%
+  slice(1:10)
+
+# recode the factors to make them shorter (so I can visualise easier)
+eff_AO$term <- recode_factor(eff_AO$term, "(Intercept)" = "PV",   
+                              "LUIMSV" = "MSV", 
+                              "LUIISVMU" = "ISVMU",
+                              "LUIISVHU" = "ISVHU",
+                              "LUIYSVMU" = "YSVMU",
+                              "LUIYSVHU" = "YSVHU", 
+                              "LUIPFMU" = "PFMU",
+                              "LUIPFHU" = "PFHU", 
+                              "LUIP" = "P", 
+                              "LUIC" = "C")
+
+# Add in upper and lower confidence intervals 
+eff_AO <- eff_AO %>%
+  mutate(Upper_ci = (median + 1.96*sd)) %>%
+  mutate(Lower_ci = (median - 1.96*sd))
+
+# Back transform the SR estimates so that I get a measure of percent difference from baseline
+eff_AO <- eff_AO %>%
+ mutate(
+    Percent_diff = ((((exp(median[1] + median)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_upper = ((((exp(median[1] + Upper_ci)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_lower = ((((exp(median[1] + Lower_ci)) / exp(median[1]))*100)-100))
+
+# Shift the baseline down to 0
+eff_AO[1,7] <- 0 #shift median
+eff_AO[1,8] <- 0 #shift upper
+eff_AO[1,9] <- 0 #shift lower 
+
+# Rename the sim eff term column name to LUI for joining
+colnames(eff_AO)[1] <- "LUI"
+
+# Left join the sim eff to the model data to make graphing easier
+eff_AO_plot_data <- left_join(model_ant_sr, eff_AO)
+```
+
+### Simulate effects of arboreal predators - group 2
+```{r}
+# gather the effects and confidence intervals using simulation. Simulate 1000 times
+eff_AP <- FEsim(model8a_AP, 1000)
+
+# make the term column a factor so it can be recoded
+eff_AP$term <- as.factor(eff_AP$term)
+
+## slice just those effects for arboreal predators
+eff_AP <- eff_AP %>%
+  slice(1:10)
+
+# recode the factors to make them shorter (so I can visualise easier)
+eff_AP$term <- recode_factor(eff_AP$term, "(Intercept)" = "PV",   
+                              "LUIMSV" = "MSV", 
+                              "LUIISVMU" = "ISVMU",
+                              "LUIISVHU" = "ISVHU",
+                              "LUIYSVMU" = "YSVMU",
+                              "LUIYSVHU" = "YSVHU", 
+                              "LUIPFMU" = "PFMU",
+                              "LUIPFHU" = "PFHU", 
+                              "LUIP" = "P", 
+                              "LUIC" = "C")
+
+# Add in upper and lower confidence intervals 
+eff_AP <- eff_AP %>%
+  mutate(Upper_ci = (median + 1.96*sd)) %>%
+  mutate(Lower_ci = (median - 1.96*sd))
+
+# Back transform the SR estimates so that I get a measure of percent difference from baseline
+eff_AP <- eff_AP %>%
+ mutate(
+    Percent_diff = ((((exp(median[1] + median)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_upper = ((((exp(median[1] + Upper_ci)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_lower = ((((exp(median[1] + Lower_ci)) / exp(median[1]))*100)-100))
+
+# Shift the baseline down to 0
+eff_AP[1,7] <- 0 #shift median
+eff_AP[1,8] <- 0 #shift upper
+eff_AP[1,9] <- 0 #shift lower
+
+# Rename the sim eff term column name to LUI for joining
+colnames(eff_AP)[1] <- "LUI"
+
+# Left join the sim eff to the model data to make graphing easier
+eff_AP_plot_data <- left_join(model_ant_sr, eff_AP)
+```
+
+### Simulate effects for group 3 - cryptobiotic attines
+```{r}
+# gather the effects and confidence intervals using simulation. Simulate 1000 times
+eff_CA <- FEsim(model8a_CA, 1000)
+
+# make the term column a factor so it can be recoded
+eff_CA$term <- as.factor(eff_CA$term)
+
+## slice just those effects for arboreal predators
+eff_CA <- eff_CA %>%
+  slice(1:10)
+
+# recode the factors to make them shorter (so I can visualise easier)
+eff_CA$term <- recode_factor(eff_CA$term, "(Intercept)" = "PV",   
+                              "LUIMSV" = "MSV", 
+                              "LUIISVMU" = "ISVMU",
+                              "LUIISVHU" = "ISVHU",
+                              "LUIYSVMU" = "YSVMU",
+                              "LUIYSVHU" = "YSVHU", 
+                              "LUIPFMU" = "PFMU",
+                              "LUIPFHU" = "PFHU", 
+                              "LUIP" = "P", 
+                              "LUIC" = "C")
+
+# Add in upper and lower confidence intervals 
+eff_CA <- eff_CA %>%
+  mutate(Upper_ci = (median + 1.96*sd)) %>%
+  mutate(Lower_ci = (median - 1.96*sd))
+
+# Back transform the SR estimates so that I get a measure of percent difference from baseline
+eff_CA <- eff_CA %>%
+ mutate(
+    Percent_diff = ((((exp(median[1] + median)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_upper = ((((exp(median[1] + Upper_ci)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_lower = ((((exp(median[1] + Lower_ci)) / exp(median[1]))*100)-100))
+
+# Shift the baseline down to 0
+eff_CA[1,7] <- 0 #shift median
+eff_CA[1,8] <- 0 #shift upper
+eff_CA[1,9] <- 0 #shift lower 
+
+# Rename the sim eff term column name to LUI for joining
+colnames(eff_CA)[1] <- "LUI"
+
+# Left join the sim eff to the model data to make graphing easier
+eff_CA_plot_data <- left_join(model_ant_sr, eff_CA)
+```
+
+
+### Simulate effects for group 4 - Generalist omnivores
+```{r}
+# gather the effects and confidence intervals using simulation. Simulate 1000 times
+eff_GO <- FEsim(model8a_GO, 1000)
+
+# make the term column a factor so it can be recoded
+eff_GO$term <- as.factor(eff_GO$term)
+
+## slice just those effects for arboreal predators
+eff_GO <- eff_GO %>%
+  slice(1:10)
+
+# recode the factors to make them shorter (so I can visualise easier)
+eff_GO$term <- recode_factor(eff_GO$term, "(Intercept)" = "PV",   
+                              "LUIMSV" = "MSV", 
+                              "LUIISVMU" = "ISVMU",
+                              "LUIISVHU" = "ISVHU",
+                              "LUIYSVMU" = "YSVMU",
+                              "LUIYSVHU" = "YSVHU", 
+                              "LUIPFMU" = "PFMU",
+                              "LUIPFHU" = "PFHU", 
+                              "LUIP" = "P", 
+                              "LUIC" = "C")
+
+# Add in upper and lower confidence intervals 
+eff_GO <- eff_GO %>%
+  mutate(Upper_ci = (median + 1.96*sd)) %>%
+  mutate(Lower_ci = (median - 1.96*sd))
+
+# Back transform the SR estimates so that I get a measure of percent difference from baseline
+eff_GO <- eff_GO %>%
+ mutate(
+    Percent_diff = ((((exp(median[1] + median)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_upper = ((((exp(median[1] + Upper_ci)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_lower = ((((exp(median[1] + Lower_ci)) / exp(median[1]))*100)-100))
+
+# Shift the baseline down to 0
+eff_GO[1,7] <- 0 #shift median
+eff_GO[1,8] <- 0 #shift upper
+eff_GO[1,9] <- 0 #shift lower 
+
+# Rename the sim eff term column name to LUI for joining
+colnames(eff_GO)[1] <- "LUI"
+
+# Left join the sim eff to the model data to make graphing easier
+eff_GO_plot_data <- left_join(model_ant_sr, eff_GO)
+```
+
+### Simulate effects for group 5 - ground dwelling generalist predators
+```{r}
+# gather the effects and confidence intervals using simulation. Simulate 1000 times
+eff_GDGP <- FEsim(model8a_GDGP, 1000)
+
+# make the term column a factor so it can be recoded
+eff_GDGP$term <- as.factor(eff_GDGP$term)
+
+## slice just those effects for arboreal predators
+eff_GDGP <- eff_GDGP %>%
+  slice(1:10)
+
+# recode the factors to make them shorter (so I can visualise easier)
+eff_GDGP$term <- recode_factor(eff_GDGP$term, "(Intercept)" = "PV",   
+                              "LUIMSV" = "MSV", 
+                              "LUIISVMU" = "ISVMU",
+                              "LUIISVHU" = "ISVHU",
+                              "LUIYSVMU" = "YSVMU",
+                              "LUIYSVHU" = "YSVHU", 
+                              "LUIPFMU" = "PFMU",
+                              "LUIPFHU" = "PFHU", 
+                              "LUIP" = "P", 
+                              "LUIC" = "C")
+
+# Add in upper and lower confidence intervals 
+eff_GDGP <- eff_GDGP %>%
+  mutate(Upper_ci = (median + 1.96*sd)) %>%
+  mutate(Lower_ci = (median - 1.96*sd))
+
+# Back transform the SR estimates so that I get a measure of percent difference from baseline
+eff_GDGP <- eff_GDGP %>%
+ mutate(
+    Percent_diff = ((((exp(median[1] + median)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_upper = ((((exp(median[1] + Upper_ci)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_lower = ((((exp(median[1] + Lower_ci)) / exp(median[1]))*100)-100))
+
+# Shift the baseline down to 0
+eff_GDGP[1,7] <- 0 #shift median
+eff_GDGP[1,8] <- 0 #shift upper
+eff_GDGP[1,9] <- 0 #shift lower 
+
+# Rename the sim eff term column name to LUI for joining
+colnames(eff_GDGP)[1] <- "LUI"
+
+# Left join the sim eff to the model data to make graphing easier
+eff_GDGP_plot_data <- left_join(model_ant_sr, eff_GDGP)
+```
+
+### Simulate effects for group 6 - ground dwelling specialist predators
+```{r}
+# gather the effects and confidence intervals using simulation. Simulate 1000 times
+eff_GDSP <- FEsim(model8a_GDSP, 1000)
+
+# make the term column a factor so it can be recoded
+eff_GDSP$term <- as.factor(eff_GDSP$term)
+
+## slice just those effects for arboreal predators
+eff_GDSP <- eff_GDSP %>%
+  slice(1:10)
+
+# recode the factors to make them shorter (so I can visualise easier)
+eff_GDSP$term <- recode_factor(eff_GDSP$term, "(Intercept)" = "PV",   
+                              "LUIMSV" = "MSV", 
+                              "LUIISVMU" = "ISVMU",
+                              "LUIISVHU" = "ISVHU",
+                              "LUIYSVMU" = "YSVMU",
+                              "LUIYSVHU" = "YSVHU", 
+                              "LUIPFMU" = "PFMU",
+                              "LUIPFHU" = "PFHU", 
+                              "LUIP" = "P", 
+                              "LUIC" = "C")
+
+# Add in upper and lower confidence intervals 
+eff_GDSP <- eff_GDSP %>%
+  mutate(Upper_ci = (median + 1.96*sd)) %>%
+  mutate(Lower_ci = (median - 1.96*sd))
+
+# Back transform the SR estimates so that I get a measure of percent difference from baseline
+eff_GDSP <- eff_GDSP %>%
+ mutate(
+    Percent_diff = ((((exp(median[1] + median)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_upper = ((((exp(median[1] + Upper_ci)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_lower = ((((exp(median[1] + Lower_ci)) / exp(median[1]))*100)-100))
+
+# Shift the baseline down to 0
+eff_GDSP[1,7] <- 0 #shift median
+eff_GDSP[1,8] <- 0 #shift upper
+eff_GDSP[1,9] <- 0 #shift lower 
+
+# Rename the sim eff term column name to LUI for joining
+colnames(eff_GDSP)[1] <- "LUI"
+
+# Left join the sim eff to the model data to make graphing easier
+eff_GDSP_plot_data <- left_join(model_ant_sr, eff_GDSP)
+```
+
+
+### Simulate effects for group 7 - leaf cutters
+```{r}
+# gather the effects and confidence intervals using simulation. Simulate 1000 times
+eff_LC <- FEsim(model8a_LC, 1000)
+
+# make the term column a factor so it can be recoded
+eff_LC$term <- as.factor(eff_LC$term)
+
+## slice just those effects for arboreal predators
+eff_LC <- eff_LC %>%
+  slice(1:10)
+
+# recode the factors to make them shorter (so I can visualise easier)
+eff_LC$term <- recode_factor(eff_LC$term, "(Intercept)" = "PV",   
+                              "LUIMSV" = "MSV", 
+                              "LUIISVMU" = "ISVMU",
+                              "LUIISVHU" = "ISVHU",
+                              "LUIYSVMU" = "YSVMU",
+                              "LUIYSVHU" = "YSVHU", 
+                              "LUIPFMU" = "PFMU",
+                              "LUIPFHU" = "PFHU", 
+                              "LUIP" = "P", 
+                              "LUIC" = "C")
+
+# Add in upper and lower confidence intervals 
+eff_LC <- eff_LC %>%
+  mutate(Upper_ci = (median + 1.96*sd)) %>%
+  mutate(Lower_ci = (median - 1.96*sd))
+
+# Back transform the SR estimates so that I get a measure of percent difference from baseline
+eff_LC <- eff_LC %>%
+ mutate(
+    Percent_diff = ((((exp(median[1] + median)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_upper = ((((exp(median[1] + Upper_ci)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_lower = ((((exp(median[1] + Lower_ci)) / exp(median[1]))*100)-100))
+
+# Shift the baseline down to 0
+eff_LC[1,7] <- 0 #shift median
+eff_LC[1,8] <- 0 #shift upper
+eff_LC[1,9] <- 0 #shift lower 
+
+# Rename the sim eff term column name to LUI for joining
+colnames(eff_LC)[1] <- "LUI"
+
+# Left join the sim eff to the model data to make graphing easier
+eff_LC_plot_data <- left_join(model_ant_sr, eff_LC)
+```
+
+### Simulate effects for group 8 - raid hunting predators
+```{r}
+# gather the effects and confidence intervals using simulation. Simulate 1000 times
+eff_RHP <- FEsim(model8a_RHP, 1000)
+
+# make the term column a factor so it can be recoded
+eff_RHP$term <- as.factor(eff_RHP$term)
+
+## slice just those effects for arboreal predators
+eff_RHP <- eff_RHP %>%
+  slice(1:10)
+
+# recode the factors to make them shorter (so I can visualise easier)
+eff_RHP$term <- recode_factor(eff_RHP$term, "(Intercept)" = "PV",  
+                              "LUIMSV" = "MSV", 
+                              "LUIISVMU" = "ISVMU",
+                              "LUIISVHU" = "ISVHU",
+                              "LUIYSVMU" = "YSVMU",
+                              "LUIYSVHU" = "YSVHU", 
+                              "LUIPFMU" = "PFMU",
+                              "LUIPFHU" = "PFHU", 
+                              "LUIP" = "P", 
+                              "LUIC" = "C")
+
+# Add in upper and lower confidence intervals 
+eff_RHP <- eff_RHP %>%
+  mutate(Upper_ci = (median + 1.96*sd)) %>%
+  mutate(Lower_ci = (median - 1.96*sd))
+
+# Back transform the SR estimates so that I get a measure of percent difference from baseline
+eff_RHP <- eff_RHP %>%
+ mutate(
+    Percent_diff = ((((exp(median[1] + median)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_upper = ((((exp(median[1] + Upper_ci)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_lower = ((((exp(median[1] + Lower_ci)) / exp(median[1]))*100)-100))
+
+# Shift the baseline down to 0
+eff_RHP[1,7] <- 0 #shift median
+eff_RHP[1,8] <- 0 #shift upper
+eff_RHP[1,9] <- 0 #shift lower 
+
+# Rename the sim eff term column name to LUI for joining
+colnames(eff_RHP)[1] <- "LUI"
+
+# Left join the sim eff to the model data to make graphing easier
+eff_RHP_plot_data <- left_join(model_ant_sr, eff_RHP)
+```
+
+### Simulate effects for group 9 - ground dwelling omnivores
+```{r}
+# gather the effects and confidence intervals using simulation. Simulate 1000 times
+eff_GDO <- FEsim(model8a_GDO, 1000)
+
+# make the term column a factor so it can be recoded
+eff_GDO$term <- as.factor(eff_GDO$term)
+
+## slice just those effects for arboreal predators
+eff_GDO <- eff_GDO %>%
+  slice(1:10)
+
+# recode the factors to make them shorter (so I can visualise easier)
+eff_GDO$term <- recode_factor(eff_GDO$term, "(Intercept)" = "PV",   
+                              "LUIMSV" = "MSV", 
+                              "LUIISVMU" = "ISVMU",
+                              "LUIISVHU" = "ISVHU",
+                              "LUIYSVMU" = "YSVMU",
+                              "LUIYSVHU" = "YSVHU", 
+                              "LUIPFMU" = "PFMU",
+                              "LUIPFHU" = "PFHU", 
+                              "LUIP" = "P", 
+                              "LUIC" = "C")
+
+# Add in upper and lower confidence intervals 
+eff_GDO <- eff_GDO %>%
+  mutate(Upper_ci = (median + 1.96*sd)) %>%
+  mutate(Lower_ci = (median - 1.96*sd))
+
+# Back transform the SR estimates so that I get a measure of percent difference from baseline
+eff_GDO <- eff_GDO %>%
+ mutate(
+    Percent_diff = ((((exp(median[1] + median)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_upper = ((((exp(median[1] + Upper_ci)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_lower = ((((exp(median[1] + Lower_ci)) / exp(median[1]))*100)-100))
+
+# Shift the baseline down to 0
+eff_GDO[1,7] <- 0 #shift median
+eff_GDO[1,8] <- 0 #shift upper
+eff_GDO[1,9] <- 0 #shift lower 
+
+# Rename the sim eff term column name to LUI for joining
+colnames(eff_GDO)[1] <- "LUI"
+
+# Left join the sim eff to the model data to make graphing easier
+eff_GDO_plot_data <- left_join(model_ant_sr, eff_GDO)
+```
+
+### Now join all of the effect estimates together
+```{r}
+## Row bind them
+ant_9_guild_data <- rbind(eff_LC, eff_CA, eff_GDO, eff_GO, eff_AO, eff_GDGP, eff_GDSP, eff_RHP, eff_AP)
+
+## Add in all of the guilds together
+ant_9_guild_data$Guild <- c("Leaf-cutters", "Leaf-cutters", "Leaf-cutters", "Leaf-cutters", "Leaf-cutters", "Leaf-cutters", "Leaf-cutters", "Leaf-cutters", "Leaf-cutters", "Leaf-cutters","Cryptobiotic attines", "Cryptobiotic attines", "Cryptobiotic attines", "Cryptobiotic attines", "Cryptobiotic attines", "Cryptobiotic attines", "Cryptobiotic attines", "Cryptobiotic attines", "Cryptobiotic attines", "Cryptobiotic attines","Ground-dwelling omnivores", "Ground-dwelling omnivores", "Ground-dwelling omnivores", "Ground-dwelling omnivores", "Ground-dwelling omnivores", "Ground-dwelling omnivores", "Ground-dwelling omnivores", "Ground-dwelling omnivores", "Ground-dwelling omnivores", "Ground-dwelling omnivores", "Generalist omnivores", "Generalist omnivores", "Generalist omnivores", "Generalist omnivores", "Generalist omnivores", "Generalist omnivores", "Generalist omnivores", "Generalist omnivores", "Generalist omnivores", "Generalist omnivores","Arboreal omnivores","Arboreal omnivores","Arboreal omnivores","Arboreal omnivores","Arboreal omnivores","Arboreal omnivores","Arboreal omnivores","Arboreal omnivores","Arboreal omnivores","Arboreal omnivores", "Ground-dwelling generalist predators", "Ground-dwelling generalist predators", "Ground-dwelling generalist predators", "Ground-dwelling generalist predators", "Ground-dwelling generalist predators", "Ground-dwelling generalist predators", "Ground-dwelling generalist predators", "Ground-dwelling generalist predators", "Ground-dwelling generalist predators", "Ground-dwelling generalist predators", "Ground-dwelling specialist predators", "Ground-dwelling specialist predators", "Ground-dwelling specialist predators", "Ground-dwelling specialist predators", "Ground-dwelling specialist predators", "Ground-dwelling specialist predators", "Ground-dwelling specialist predators", "Ground-dwelling specialist predators", "Ground-dwelling specialist predators", "Ground-dwelling specialist predators","Raid-hunting predators", "Raid-hunting predators", "Raid-hunting predators", "Raid-hunting predators", "Raid-hunting predators", "Raid-hunting predators", "Raid-hunting predators", "Raid-hunting predators", "Raid-hunting predators", "Raid-hunting predators", "Arboreal predators","Arboreal predators","Arboreal predators","Arboreal predators","Arboreal predators","Arboreal predators","Arboreal predators","Arboreal predators","Arboreal predators","Arboreal predators")
+
+## Fill in the guild higher column in case I want to group
+ant_9_guild_data$Guild_higher <- ifelse(ant_9_guild_data$Guild == "Leaf-cutters" | ant_9_guild_data$Guild == "Cryptobiotic attines", "Herbivore", ifelse(ant_9_guild_data$Guild == "Ground-dwelling omnivores" | ant_9_guild_data$Guild == "Generalist omnivores" | ant_9_guild_data$Guild =="Arboreal omnivores", "Omnivore", "Predator") )
+
+## make it a factor
+ant_9_guild_data$Guild <- as.factor(ant_9_guild_data$Guild)
+ant_9_guild_data$Guild_higher <- as.factor(ant_9_guild_data$Guild_higher)
+levels(ant_9_guild_data$Guild)
+
+## Relevel to make it in order of herb - omni - pred
+ant_9_guild_data$Guild <- factor(ant_9_guild_data$Guild, levels = c("Leaf-cutters", "Cryptobiotic attines", "Ground-dwelling omnivores",  "Generalist omnivores", "Arboreal omnivores", "Ground-dwelling generalist predators",  "Ground-dwelling specialist predators", "Raid-hunting predators", "Arboreal predators"))
+
+levels(ant_9_guild_data$Guild_higher)
+```
+
+### Generate the results
+
+### Herbivores
+```{r}
+## Cryptobiotic attines
+summary(model8a_CA)
+```
+
+### Omnivores
+```{r}
+## omnivores have three groups - ground dwelling omnivores, generalist omnivores, arboreal omnivores
+summary(model8a_GDO)
+summary(model8a_GO)
+summary(model8a)
+```
+
+### Predators
+```{r}
+## Predators have 4 categories - arboreal predators, ground dwelling specialists, ground dwelling generalists, raid hunting predators
+summary(model8a_AP)
+summary(model8a_GDGP)
+summary(model8a_GDSP)
+summary(model8a_RHP)
+```
+
+### get the marginal and conditional R^2 of the model
+```{r}
+ant_tier_9_r_squared <- r.squaredGLMM(model8a)
+ant_tier_9_r_squared <- as.data.frame(ant_tier_9_r_squared)
+```
+
+### get the model output and tidy it up
+```{r}
+library(broom)
+model8_summary <- tidy(model8a)
+model8_summary
+```
+
+### Output everything so I can just load it later without having to look back at the model
+```{r}
+write.csv(ant_tier_9_r_squared, "ant_sr_9_guild_model_r_squared.csv")
+write.csv(model8_summary, "ant_sr_9_guild_model_output.csv")
+write.csv(ant_9_guild_data, "ant_sr_9_guild_transformed_differences.csv")
+```
+
+### Save the model data I am using here so I can calculate Simpson's diversity index
+```{r}
+write.csv(model_ant_sr, "9_guild_ant_model_sr.csv")
+```
+
+# PLOTTING
+
+### Make the limits and colors
+```{r}
+## x axis labels
+X_Limits <- c("PV", "MSV", "ISVMU", "ISVHU", "YSVMU", "YSVHU", "PFMU", "PFHU", "P", "C")
+
+## colors of categories
+color_palette <- c("chartreuse3", "olivedrab", "aquamarine2", "cadetblue3", "blue1", "lightpink3", "orange", "firebrick1", "firebrick4")
+```
+
+## Create the combined plot
+```{r}
+## Plot the effect estimate as the percent species richness difference from primary vegetation
+guild_9_tier_plot_2 <- ant_9_guild_data %>%
+  ggplot()+
+  aes(x = LUI, y = Percent_diff, colour = Guild)+
+  geom_hline(yintercept = 0, size = 0.75, color = ("black"), linetype = 1 )+
+  geom_vline(xintercept = 1.5, linetype = 2)+
+  geom_vline(xintercept = 2.5, linetype = 2)+
+  geom_vline(xintercept = 3.5, linetype = 2)+
+  geom_vline(xintercept = 4.5, linetype = 2)+
+  geom_vline(xintercept = 5.5, linetype = 2)+
+  geom_vline(xintercept = 6.5, linetype = 2)+
+  geom_vline(xintercept = 7.5, linetype = 2)+
+  geom_vline(xintercept = 8.5, linetype = 2)+
+  geom_vline(xintercept = 9.5, linetype = 2)+
+  scale_x_discrete(limits=X_Limits, labels=c("PV", "MSV", "ISVMU", "ISVHU", "YSVMU", "YSVHU", "PFMU", "PFHU", "P", "C"))+   xlab("") + ## can add labels = c("")...
+  facet_grid(Guild_higher~., scales = "free")+
+  geom_point(size = 2, position = position_dodge(width = 0.75))+
+  geom_linerange(aes(ymin = Percent_lower, ymax = Percent_upper), position = position_dodge(width=0.75), size = 0.75)+
+  theme_classic()+
+  theme(axis.text.x = element_text(face= "bold", angle = 45, hjust = 1),
+        strip.background = element_rect(color=NA, size=1.5),
+        panel.border = element_rect(colour = "black",  fill=NA),
+        axis.title.x = element_blank(),
+        legend.position = "bottom")+
+  xlab("Land use intensity class")+
+  ylab("Species richness difference (%)")+
+  scale_colour_manual(values=color_palette)+
+guild_9_tier_plot_2
+```
+
+### make the herbivore plot
+```{r}
+## filter out just the herbivores and save
+herbivore_plot_data <- ant_9_guild_data %>%
+  filter(Guild_higher == "Herbivore")
+
+## create herbivore colors
+herb_colors <- c("chartreuse3", "olivedrab")
+
+## plot the data
+herbivore_9_guild_plot <- herbivore_plot_data %>%
+  ggplot()+
+  aes(x = LUI, y = Percent_diff, ymin = Percent_lower, ymax = Percent_upper, colour = Guild)+
+  geom_hline(yintercept = 0, size = 0.5, color = ("black"), linetype = 1 )+
+  geom_vline(xintercept = 1.5, linetype = 2)+
+  geom_vline(xintercept = 2.5, linetype = 2)+
+  geom_vline(xintercept = 3.5, linetype = 2)+
+  geom_vline(xintercept = 4.5, linetype = 2)+
+  geom_vline(xintercept = 5.5, linetype = 2)+
+  geom_vline(xintercept = 6.5, linetype = 2)+
+  geom_vline(xintercept = 7.5, linetype = 2)+
+  geom_vline(xintercept = 8.5, linetype = 2)+
+  geom_vline(xintercept = 9.5, linetype = 2)+
+  scale_x_discrete(limits=X_Limits, labels=c("PV", "MSV", "ISVMU", "ISVHU", "YSVMU", "YSVHU", "PFMU", "PFHU", "P", "C"))+
+  geom_point(size = 2, position = position_dodge(width = 0.75), shape=15)+
+  geom_linerange(aes(ymin = Percent_lower, ymax = Percent_upper), position = position_dodge(width=0.75), size = 0.75)+
+  theme_classic()+
+  theme(axis.text.x = element_text(face= "bold", angle = 45, hjust = 1),
+        legend.title = element_blank(),
+        legend.position = "none",
+        axis.title.x = element_blank(),
+        panel.border = element_rect(colour = "black",  fill=NA),
+        axis.title.y = element_text(face = "bold"),
+        plot.title = element_text(face = "bold"))+
+  ggtitle("Herbivores")+
+  xlab("Land use intensity class")+
+  ylab("Species richness difference (%)")+
+  scale_colour_manual(values=herb_colors)
+herbivore_9_guild_plot
+```
+
+## make omnivore plot
+```{r}
+## filter out just the omnivores and save
+omnivore_plot_data <- ant_9_guild_data %>%
+  filter(Guild_higher == "Omnivore")
+
+## create omnivore colors
+omni_colors <- c("aquamarine2", "cadetblue3", "blue1")
+
+## plot the data
+omnivore_9_guild_plot <- omnivore_plot_data %>%
+  ggplot()+
+  aes(x = LUI, y = Percent_diff, ymin = Percent_lower, ymax = Percent_upper, colour = Guild)+
+  geom_hline(yintercept = 0, size = 0.5, color = ("black"), linetype = 1 )+
+  geom_vline(xintercept = 1.5, linetype = 2)+
+  geom_vline(xintercept = 2.5, linetype = 2)+
+  geom_vline(xintercept = 3.5, linetype = 2)+
+  geom_vline(xintercept = 4.5, linetype = 2)+
+  geom_vline(xintercept = 5.5, linetype = 2)+
+  geom_vline(xintercept = 6.5, linetype = 2)+
+  geom_vline(xintercept = 7.5, linetype = 2)+
+  geom_vline(xintercept = 8.5, linetype = 2)+
+  geom_vline(xintercept = 9.5, linetype = 2)+
+  scale_x_discrete(limits=X_Limits, labels=c("PV", "MSV", "ISVMU", "ISVHU", "YSVMU", "YSVHU", "PFMU", "PFHU", "P", "C"))+
+  geom_point(size = 2, position = position_dodge(width = 0.75), shape=15)+
+  geom_linerange(aes(ymin = Percent_lower, ymax = Percent_upper), position = position_dodge(width=0.75), size = 0.75)+
+  theme_classic()+
+  theme(axis.text.x = element_text(face= "bold", angle = 45, hjust = 1),
+        legend.title = element_blank(),
+        axis.title.x = element_blank(),
+        legend.position = "none",
+        panel.border = element_rect(colour = "black",  fill=NA),
+        axis.title.y = element_text(face = "bold"),
+        plot.title = element_text(face = "bold"))+
+  ggtitle("Omnivores")+
+  xlab("Land use intensity class")+
+  ylab("Species richness difference (%)")+
+  scale_colour_manual(values=omni_colors)
+omnivore_9_guild_plot
+```
+
+## Make the predator plot
+```{r}
+## filter out just the predators and save
+predator_plot_data <- ant_9_guild_data %>%
+  filter(Guild_higher == "Predator")
+
+## create omnivore colors
+pred_colors <- c("lightpink3", "orange", "firebrick1", "firebrick4")
+
+## plot the data
+predator_9_guild_plot <- predator_plot_data %>%
+  ggplot()+
+  aes(x = LUI, y = Percent_diff, ymin = Percent_lower, ymax = Percent_upper, colour = Guild)+
+  geom_hline(yintercept = 0, size = 0.5, color = ("black"), linetype = 1 )+
+  geom_vline(xintercept = 1.5, linetype = 2)+
+  geom_vline(xintercept = 2.5, linetype = 2)+
+  geom_vline(xintercept = 3.5, linetype = 2)+
+  geom_vline(xintercept = 4.5, linetype = 2)+
+  geom_vline(xintercept = 5.5, linetype = 2)+
+  geom_vline(xintercept = 6.5, linetype = 2)+
+  geom_vline(xintercept = 7.5, linetype = 2)+
+  geom_vline(xintercept = 8.5, linetype = 2)+
+  geom_vline(xintercept = 9.5, linetype = 2)+
+  scale_x_discrete(limits=X_Limits, labels=c("PV", "MSV", "ISVMU", "ISVHU", "YSVMU", "YSVHU", "PFMU", "PFHU", "P", "C"))+
+  geom_point(size = 2, position = position_dodge(width = 0.75), shape=15)+
+  geom_linerange(aes(ymin = Percent_lower, ymax = Percent_upper), position = position_dodge(width=0.75), size = 0.75)+
+  theme_classic()+
+  theme(axis.text.x = element_text(face= "bold", angle = 45, hjust = 1),
+        legend.title = element_blank(),
+        axis.title.x = element_blank(),
+        legend.position = "none",
+        panel.border = element_rect(colour = "black",  fill=NA),
+        axis.title.y = element_text(face = "bold"),
+        plot.title = element_text(face = "bold"))+
+  ggtitle("Predators")+
+  xlab("Land use intensity class")+
+  ylab("Species richness difference (%)")+
+  scale_colour_manual(values=pred_colors)
+predator_9_guild_plot
+```
+
+## get the legend
+```{r}
+## create a bar chart of the categories, extract the legend
+my_legend <- ggplot(ant_9_guild_data, aes(x = LUI, fill = Guild)) + 
+  scale_fill_manual(values=color_palette)+
+  guides(fill=guide_legend(title.position = "top", nrow=3,byrow=TRUE))+
+  theme(legend.position = "bottom",
+        legend.text = element_text(face = "bold", size = 8),
+        legend.title = element_text(face = "bold"))+
+  geom_bar()
+my_legend
+
+# Using the cowplot package
+legend <- cowplot::get_legend(my_legend)
+plot_legend <- as_ggplot(legend)
+```
+
+### Combine the plots and export them 
+```{r}
+Ant_SR_9_plots_1 <- ggarrange(herbivore_9_guild_plot, omnivore_9_guild_plot,
+                    labels = c("A", "B"),
+                    ncol = 1, nrow = 2)
+Ant_SR_9_plots_2 <- ggarrange(predator_9_guild_plot, plot_legend,
+                    labels = c("C", ""),
+                    ncol = 1, nrow = 2)
+
+ggexport(Ant_SR_9_plots_1, filename = "Ant_SR_9_plots_1.pdf")
+ggexport(Ant_SR_9_plots_2, filename = "Ant_SR_9_plots_2.pdf")
+```

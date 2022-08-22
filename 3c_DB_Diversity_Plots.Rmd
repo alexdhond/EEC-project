@@ -1,0 +1,234 @@
+---
+title: "3c_DB_Diversity_Plots"
+author: "Alex Dhond"
+date: "8/10/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This file is for loading in the dung beetle biodiversity data, plotting the figures, combining them into one figure, and then exporting to PDF
+
+### For clearing the workspace prior to running
+```{r}
+rm(list=ls())
+```
+
+### Load the required packages
+```{r}
+## Data manipulation ## 
+library(dplyr) # data manipulation
+library(tidyr) # data manipulation
+
+## Plotting ## 
+library(ggplot2) # basic plotting package
+library(ggpubr) # for arranging and exporting plots
+library(cowplot) # for arranging and exporting plots
+```
+
+### Load in any colors and variables
+```{r}
+## Load in a color palette
+cbbPalette <- c("#000000", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+```
+
+### Load in the figure files
+```{r}
+## Load in abundance plot
+DB_abundance_plot <- read.csv("DB_abundance_data_for_plots.csv")
+
+## reorder levels for lui
+DB_abundance_plot$LUI <- factor(DB_abundance_plot$LUI, levels = c("PVMU", "PVHU", "MSV", "ISV", "YSV", "PF", "PMU", "PLU", "PIU", "CMU", "CHU"))
+
+#reorder levels for Predominant land use
+DB_abundance_plot$Predominant_land_use <- factor(DB_abundance_plot$Predominant_land_use, levels = c("Primary vegetation", "Mature secondary vegetation", "Intermediate secondary vegetation", "Young secondary vegetation", "Plantation forest", "Pasture", "Cropland"))
+
+
+## Load in species richness plot
+DB_speciesrichness_plot <- read.csv("DB_species_richness_data_for_plots.csv")
+
+## reorder levels for lui
+DB_speciesrichness_plot$LUI <- factor(DB_speciesrichness_plot$LUI, levels = c("PVMU", "PVHU", "MSV", "ISV", "YSV", "PF", "PMU", "PLU", "PIU", "CMU", "CHU"))
+
+#reorder levels for Predominant land use
+DB_speciesrichness_plot$Predominant_land_use <- factor(DB_speciesrichness_plot$Predominant_land_use, levels = c("Primary vegetation", "Mature secondary vegetation", "Intermediate secondary vegetation", "Young secondary vegetation", "Plantation forest", "Pasture", "Cropland"))
+
+
+## Load in simpson plot
+DB_simpson_plot <- read.csv("DB_Simpson_plotting.csv")
+#reorder levels for LUI
+DB_simpson_plot$LUI <- factor(DB_simpson_plot$LUI, levels = c("PVMU", "PVHU", "MSV", "ISV", "YSV", "PF", "PMU", "PLU", "PIU", "CMU", "CHU"))
+
+#reorder levels for Predominant land use
+DB_simpson_plot$Predominant_land_use <- factor(DB_simpson_plot$Predominant_land_use, levels = c("Primary vegetation", "Mature secondary vegetation", "Intermediate secondary vegetation", "Young secondary vegetation", "Plantation forest", "Pasture", "Cropland"))
+```
+
+### For plotting, make a new "use intensity" SPECIES RICHNESS
+```{r}
+## make a new use intensity column
+DB_speciesrichness_plot <- DB_speciesrichness_plot %>%
+  mutate(
+    Use_intensity2 = ifelse(LUI == "PVMU" | LUI == "CMU" | LUI == "PMU", "Minimal use", ifelse(LUI == "PVHU" | LUI == "CHU", "Higher use", ifelse(LUI == "PLU", "Light use", ifelse(LUI == "PIU", "Intense use", "Average"))))
+  )
+
+## make it a factor
+DB_speciesrichness_plot$Use_intensity2 <- factor(DB_speciesrichness_plot$Use_intensity2, levels = c("Average", "Minimal use", "Light use", "Higher use", "Intense use"))
+
+levels(DB_speciesrichness_plot$Use_intensity2)
+```
+
+### For plotting, make a new "use intensity" ABUNDANCE
+```{r}
+## make a new use intensity column
+DB_abundance_plot <- DB_abundance_plot %>%
+  mutate(
+    Use_intensity2 = ifelse(LUI == "PVMU" | LUI == "CMU" | LUI == "PMU", "Minimal use", ifelse(LUI == "PVHU" | LUI == "CHU", "Higher use", ifelse(LUI == "PLU", "Light use", ifelse(LUI == "PIU", "Intense use", "Average"))))
+  )
+
+## make it a factor
+DB_abundance_plot$Use_intensity2 <- factor(DB_abundance_plot$Use_intensity2, levels = c("Average", "Minimal use", "Light use", "Higher use", "Intense use"))
+
+levels(DB_abundance_plot$Use_intensity2)
+```
+
+### For plotting, make a new "use intensity" SIMPSONS
+```{r}
+## make a new use intensity column
+DB_simpson_plot <- DB_simpson_plot %>%
+  mutate(
+    Use_intensity2 = ifelse(LUI == "PVMU" | LUI == "CMU" | LUI == "PMU", "Minimal use", ifelse(LUI == "PVHU" | LUI == "CHU", "Higher use", ifelse(LUI == "PLU", "Light use", ifelse(LUI == "PIU", "Intense use", "Average"))))
+  )
+
+## make it a factor
+DB_simpson_plot$Use_intensity2 <- factor(DB_simpson_plot$Use_intensity2, levels = c("Average", "Minimal use", "Light use", "Higher use", "Intense use"))
+
+levels(DB_simpson_plot$Use_intensity2)
+```
+
+### Set up all things needed for plots
+```{r}
+## set up the limits along the x axis
+DB_X_Limits <- c("PVMU", "PVHU",
+              "MSV",
+              "ISV",
+              "YSV",
+              "PF",
+              "PMU",
+              "PLU",
+              "PIU",
+              "CMU",
+              "CHU")
+
+## set up land use limits 
+DB_X_Limits_2 <- c("Primary vegetation", "Mature secondary vegetation", "Intermediate secondary vegetation", "Young secondary vegetation", "Plantation forest", "Pasture", "Cropland")
+```
+
+### Make the plots 
+```{r}
+## Make species richness plot
+DB_sr_figure <- DB_speciesrichness_plot %>%
+  ggplot()+
+  aes(x = Predominant_land_use, y = Percent_diff, ymin = Percent_lower, ymax = Percent_upper, colour = Predominant_land_use, shape = Use_intensity2)+
+  geom_hline(yintercept = 0, size = 0.5, color = "black", linetype = 1)+
+  geom_point(aes(shape = Use_intensity2), size = 4, position = position_dodge(width = 0.75))+
+  geom_linerange(size = 1, position = position_dodge(width = 0.75))+
+  scale_x_discrete(limits=DB_X_Limits_2, labels=c("Primary", "MSV", "ISV", "YSV", "Plantation", "Pasture", "Cropland")) + xlab("") + ## can add labels = c("")..
+  theme_classic()+
+  theme(axis.text.x = element_text(colour = cbbPalette, face= "bold", angle = 45, hjust = 1),
+        axis.title.x = element_blank(),
+        axis.title.y = element_text(face = "bold"),
+        panel.border = element_rect(colour = "black",  fill=NA))+
+  xlab("Land use intensity class")+
+  ylab("Species richness difference (%)")+
+  scale_colour_manual(values=cbbPalette)+
+  scale_shape_manual(values=c(4, 16, 17, 18, 15))+
+  theme(legend.position = "none")
+DB_sr_figure
+
+## Make abundance plot
+DB_abundance_figure <- DB_abundance_plot %>%
+ggplot()+
+  aes(x = Predominant_land_use, y = Percent_diff, ymin = Percent_lower, ymax = Percent_upper, colour = Predominant_land_use, shape = Use_intensity2)+
+  geom_hline(yintercept = 0, size = 0.5, color = "black", linetype = 1)+
+  geom_point(aes(shape = Use_intensity2), size = 4, position = position_dodge(width = 0.75))+
+  geom_linerange(size = 1, position = position_dodge(width = 0.75))+
+  scale_x_discrete(limits=DB_X_Limits_2, labels=c("Primary", "MSV", "ISV", "YSV", "Plantation", "Pasture", "Cropland")) + xlab("") + ## can add labels = c("")..
+  theme_classic()+
+  theme(axis.text.x = element_text(colour = cbbPalette, face= "bold", angle = 45, hjust = 1),
+        axis.title.x = element_blank(),
+        axis.title.y = element_text(face = "bold"),
+        panel.border = element_rect(colour = "black",  fill=NA))+
+  xlab("Land use intensity class")+
+  ylab("Total abundance difference (%)")+
+  scale_colour_manual(values=cbbPalette)+
+  scale_shape_manual(values=c(4, 16, 17, 18, 15))+
+  theme(legend.position = "none")
+DB_abundance_figure
+
+## Make simpsons diversity plot 
+DB_simpson_figure <- DB_simpson_plot %>%
+ggplot()+
+  aes(x = Predominant_land_use, y = Percent_diff, ymin = Percent_lower, ymax = Percent_upper, colour = Predominant_land_use, shape = Use_intensity2)+
+  geom_hline(yintercept = 0, size = 0.5, color = "black", linetype = 1)+
+  geom_point(aes(shape = Use_intensity2), size = 4, position = position_dodge(width = 0.75))+
+  geom_linerange(size = 1, position = position_dodge(width = 0.75))+
+  scale_x_discrete(limits=DB_X_Limits_2, labels=c("Primary", "MSV", "ISV", "YSV", "Plantation", "Pasture", "Cropland")) + xlab("") + ## can add labels = c("")..
+  theme_classic()+
+  theme(axis.text.x = element_text(colour = cbbPalette, face= "bold", angle = 45, hjust = 1),
+        axis.title.x = element_blank(),
+        axis.title.y = element_text(face = "bold"),
+        panel.border = element_rect(colour = "black",  fill=NA))+
+  xlab("Land use intensity class")+
+  ylab("Simpson's diversity difference (%)")+
+  scale_colour_manual(values=cbbPalette)+
+  scale_shape_manual(values=c(4, 16, 17, 18, 15))+
+  theme(legend.position = "none")
+DB_simpson_figure
+```
+
+### make the legend for the plot
+```{r}
+## create a new plot, extract the legend
+DB_sr_figure_legend <- DB_speciesrichness_plot %>%
+  ggplot()+
+  aes(x = Predominant_land_use, y = Percent_diff, ymin = Percent_lower, ymax = Percent_upper, colour = Predominant_land_use, shape = Use_intensity2)+
+  geom_hline(yintercept = 0, size = 0.5, color = "black", linetype = 1)+
+  geom_point(aes(shape = Use_intensity2), size = 4, position = position_dodge(width = 0.75))+
+  geom_linerange(size = 1, position = position_dodge(width = 0.75))+
+  scale_x_discrete(limits=DB_X_Limits_2, labels=c("Primary", "MSV", "ISV", "YSV", "Plantation", "Pasture", "Cropland")) + xlab("") + ## can add labels = c("")..
+  theme_classic()+
+  theme(axis.text.x = element_text(colour = cbbPalette, face= "bold", angle = 45, hjust = 1),
+        axis.title.x = element_blank(),
+        axis.title.y = element_text(face = "bold"),
+        panel.border = element_rect(colour = "black",  fill=NA))+
+  xlab("Land use intensity class")+
+  ylab("Species richness difference (%)")+
+  scale_colour_manual(values=cbbPalette)+
+  scale_shape_manual(values=c(4, 16, 17, 18, 15))+
+  theme(legend.position = "bottom",
+        legend.text = element_text(face = "bold"),
+        legend.title = element_text(face = "bold"))+
+  guides(shape = guide_legend("Use Intensity:"),
+         color = F)
+
+# Using the cowplot package
+DB_legend <- cowplot::get_legend(DB_sr_figure_legend)
+DB_legend
+DB_plot_legend <- as_ggplot(DB_legend)
+DB_plot_legend
+```
+
+### Combine all the plots together and export
+```{r}
+DB_diversity_plots_1 <- ggarrange(DB_abundance_figure, DB_sr_figure,
+                    labels = c("A", "B"),
+                    ncol = 1, nrow = 2)
+DB_diversity_plots_2 <- ggarrange(DB_simpson_figure, DB_plot_legend,
+                    labels = c("C", ""),
+                    ncol = 1, nrow = 2)
+
+ggexport(DB_diversity_plots_1, filename = "DB_diversity_plots_1.pdf")
+ggexport(DB_diversity_plots_2, filename = "DB_diversity_plots_2.pdf")
+```

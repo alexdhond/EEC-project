@@ -1,0 +1,516 @@
+---
+title: "4_Ant_Site_Diversity"
+author: "Alex Dhond"
+date: "7/27/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This script is for testing Ant data site metrics. In this script, I want to get a general overview of ant species richness for land-use intensity across my sites in the Neotropics. I hope to see broad trends in abundance and species richness across different land uses and use intensities
+
+Due to the data spread, and the fact that most ant data is occurrence measurements, I am not able to get a good measure of ant abundance. Therefore, I am only calculating species richness in this script.
+
+### For clearing the workspace prior to running
+```{r}
+rm(list=ls())
+```
+
+### Load the required packages
+```{r}
+## Data manipulation ## 
+library(dplyr) # data manipulation
+library(tidyr) # data manipulation
+
+## Modelling ## 
+library(lme4) # creating mixed effects models
+library(car) # for LRT / anova comparisons
+library(merTools) # for extracting model estimates
+library(MuMIn) # for assessing model fit
+library(optimx) #optimizing models
+library(DHARMa) #for model validation
+
+## Plotting ## 
+library(ggplot2) # basic plotting package
+library(ggpubr) # for arranging and exporting plots
+library(cowplot) # for arranging and exporting plots
+```
+
+### Load in any required functions
+```{r}
+## Load in the source function for checking GVIFs - for collinearity
+source("https://highstat.com/Books/Book2/HighstatLibV10.R")
+
+## Load in a model criticism function - this function is used for checking the residual/model diagnostic plots to test that the model is meeting all of its assumptions
+model_plot <-function(mod.for.plot){
+  require(lattice)
+  
+  # set up a 2 x 2 grid for plotting
+  par(mfrow = c(1,3))
+  par(ask = TRUE)
+  
+  # qqplot
+  qqnorm(resid(mod.for.plot))
+  qqline(resid(mod.for.plot), col = 2)
+  
+  # residuals vs fitted plot
+  plot(fitted(mod.for.plot), resid(mod.for.plot),xlab = "Fitted Values", ylab = "Residuals", main = "Residuals vs fitted")
+  abline(h=0, lty=2)
+  lines(smooth.spline(fitted(mod.for.plot), resid(mod.for.plot)), col = "red")
+  
+  # histogram of residuals
+  hist(resid(mod.for.plot))
+  
+  # random effects distribution
+  dotplot(ranef(mod.for.plot,condVar = TRUE))
+}
+
+## Load in an overdispersion function from this website to help test if the models are overdispersed.
+# https://bbolker.github.io/mixedmodels-misc/glmmFAQ.html#testing-for-overdispersioncomputing-overdispersion-factor
+overdisp_fun <- function(model) {
+    rdf <- df.residual(model)
+    rp <- residuals(model,type="pearson")
+    Pearson.chisq <- sum(rp^2)
+    prat <- Pearson.chisq/rdf
+    pval <- pchisq(Pearson.chisq, df=rdf, lower.tail=FALSE)
+    c(chisq=Pearson.chisq,ratio=prat,rdf=rdf,p=pval)
+}
+```
+
+### Load in a colour palette (for the figures)
+```{r}
+## Load in a color palette
+cbbPalette <- c("#000000", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+```
+
+### Read in the Ants data
+```{r}
+NeoAnts <- read.csv("NeoAnts.csv")
+```
+
+### Generate the Neotropical ant sites
+```{r}
+NeoAntSites <- NeoAnts %>%
+
+  # pull out only the merged diversity data
+  distinct(merge_ID, .keep_all = TRUE) %>%
+  
+  # re-make SSB and SSBS values since we've now dropped a bunch of values
+  mutate(SS = paste(Source_ID, Study_number),
+         SSB = paste(SS, Block),
+         SSBS = paste(SSB, Site_number)) %>%
+  
+  # group by SSBS (each unique value corresponds to a unique site)
+  group_by(SSBS) %>%
+  
+  # now add up all the abundance measurements within each site
+  mutate(TotalAbundance = ifelse(Diversity_metric_type == "Abundance",
+                                 sum(merged_diversity),
+                                 # if the diversity metric type isn't Abundance, then leave the TotalAbundance measurement as NA
+                                 NA),
+         
+         # if the metric is already species richness
+         SpeciesRichness = ifelse(Diversity_metric_type == "Species richness",
+                                  # just use the value as given
+                                  merged_diversity,
+                                  # for abundance and occurrence measurements, count the number of unique species names that are present at the site 
+                                  n_distinct(Taxon_name_entered[merged_diversity > 0])),
+         
+         # calculate Chao's Species Richness Estimator
+         # if the diversity metric is suitable for this calculation
+         ChaoRichness = ifelse(Diversity_metric_is_suitable_for_Chao == TRUE,
+                               # calculate the Chao estimator
+                               sum(merged_diversity > 0) + (((sum(merged_diversity == 1) * (sum(merged_diversity == 1)-1)) / (2*(sum(merged_diversity == 2)+1)))),
+                               # otherwise give Chao NA
+                               NA)
+         ) %>%
+  
+  # ungroup
+  ungroup() %>%
+  
+    # now group by Study ID
+  group_by(SS) %>%
+  
+  # pull out some useful study-level numbers
+  # maximum abundance for each study
+  mutate(MaxAbundance = max(TotalAbundance),
+         # minimum (non-zero) abundance for each study
+         # we'll use this when we do species rarefaction
+         MinNonZeroAbundance = min(TotalAbundance[TotalAbundance > 0]),
+         # number of species in the study
+         SpeciesInStudy = n_distinct(Taxon_name_entered[merged_diversity > 0]),
+         # assess whether the study is suitable for rarefaction
+         SuitableForRarefaction = ifelse(
+           # if all diversity measurements are integers
+           # i.e. if you round down, it should be equal to the original number
+           # and the diversity metric is suitable for Chao
+           all(floor(merged_diversity) == merged_diversity) &
+             Diversity_metric_is_suitable_for_Chao == TRUE,
+           # then class the study as suitable for rarefaction
+           TRUE,
+           # otherwise it can't be used
+           FALSE
+           )
+         ) %>%
+  
+  # ungroup
+  ungroup()  %>%
+  
+  # now rescale total abundance, so that within each study, abundance varies from 0 to 1.
+  mutate(RescaledAbundance = TotalAbundance/MaxAbundance,
+         # for statistical modelling, we'll also calculate the square root of species abundance, although we might want to use log(x+1) transformation instead
+         sqrtRescaledAbundance = sqrt(RescaledAbundance),
+         logRescaledAbundance = log(RescaledAbundance + 1)
+         )
+
+# pull out unique sites
+NeoAntSites <- NeoAntSites %>%
+  distinct(SSBS, .keep_all = TRUE)
+```
+
+### check the number of sources, studies, and sites
+```{r}
+#ants
+length(unique(NeoAntSites$Source_ID)) #number of sources
+length(unique(NeoAntSites$SS)) #number of studies
+length(unique(NeoAntSites$SSBS)) #number of sites
+```
+
+# ANTS
+Here I am going to do the same thing I did with dung beetle sites, but with the ant sites
+### check what interactions and levels I need to remove
+```{r}
+table(NeoAntSites$Predominant_land_use, NeoAntSites$Use_intensity)
+```
+
+### Based on the Ant sites table, there are a number of alterations I probably need to make before the analyses.
+* Remove "Urban" as there is only 1 site
+* Collapse the "Cannot Decide" and "Indeterminate Secondary Vegetation"
+* Collapse land use categories together
+  + Combine "Primary forest" and "Primary non-forest"
+* Collapse multiple intensities together due to lack of data
+  + Create a "higher use (H)" by combining Light and Intense together for all land uses
+  
+In this chunk I will collapse primary vegetation together and remove all NAs and Indeterminates and remove urban sites.
+```{r}
+NeoAntSites <- NeoAntSites %>%
+  
+  mutate(
+
+     # collapse primary forest and non-forest together into primary vegetation as these aren't well distinguished
+    Predominant_land_use = recode_factor(Predominant_land_use, 
+                                  "Primary forest" = "Primary vegetation", 
+                                  "Primary non-forest" = "Primary vegetation"),
+    
+    # indeterminate secondary veg and cannot decide get NA
+    Predominant_land_use = na_if(Predominant_land_use, "Secondary vegetation (indeterminate age)"),
+    Predominant_land_use = na_if(Predominant_land_use, "Cannot decide"),
+    Use_intensity = na_if(Use_intensity, "Cannot decide"),
+)
+
+NeoAntSites <- droplevels(subset(NeoAntSites, Predominant_land_use != "Urban"))
+
+# take another look at the LandUse/Use intensity split
+table(NeoAntSites$Predominant_land_use, NeoAntSites$Use_intensity) 
+```
+
+### Collapse all land uses so there are (ideally) two intensities, "minimal" and "higher". If not, make sure each category has at least 30 observations in it
+Since I already ran some code with "LightIntense" I am going to keep it like that until I get further down.
+```{r}
+NeoAntSites <- NeoAntSites %>%
+  mutate(LUI = interaction(Predominant_land_use, Use_intensity, sep = "_"),
+         
+         # collapse Primary vegetation into one category
+         LUI = recode_factor(LUI, "Primary vegetation_Minimal use" = "Primary vegetation", "Primary vegetation_Light use" = "Primary vegetation", "Primary vegetation_Intense use" = "Primary vegetation"),
+         
+         #collapse young secondary together
+         LUI = recode_factor(LUI, "Young secondary vegetation_Intense use" = "Young secondary vegetation_LightIntense", 
+                             "Young secondary vegetation_Light use" = "Young secondary vegetation_LightIntense"),
+         
+         #collapse Cropland Itogether"
+         LUI = recode_factor(LUI, "Cropland_Intense use" = "Cropland",
+                             "Cropland_Light use" = "Cropland",
+                             "Cropland_Minimal use" = "Cropland"),
+         
+         #collapse plantation forest intense and light together
+         LUI = recode_factor(LUI, "Plantation forest_Intense use" = "Plantation forest_LightIntense",
+                             "Plantation forest_Light use" = "Plantation forest_LightIntense"),
+         
+         #collapse Intermediate secondary vegetation light and intense together
+         LUI = recode_factor(LUI, "Intermediate secondary vegetation_Intense use" = "Intermediate secondary vegetation_LightIntense", "Intermediate secondary vegetation_Light use" = "Intermediate secondary vegetation_LightIntense"),
+         
+         #collapse Pasture into light and intense
+         LUI = recode_factor(LUI, "Pasture_Light use" = "Pasture",
+                             "Pasture_Intense use" = "Pasture",
+                             "Pasture_Minimal use" = "Pasture"),
+        
+  )
+
+#remove the categories with no data
+NeoAntSites <- droplevels(subset(NeoAntSites, LUI != "Mature secondary vegetation_Light use" | LUI != "Mature secondary vegetation_Intense use"))
+
+#check to see it has worked
+table(NeoAntSites$LUI)
+```
+
+### Recode the names of the LUI categories to make them shorter
+Here, I am making the "LightIntense" category "Higher (H)"
+```{r}
+#LightIntense use category will be classified as "Higher (H)" use for brevity
+NeoAntSites<- NeoAntSites%>%
+  mutate(LUI = plyr::revalue(LUI, c("Primary vegetation" = "PV",
+                                    "Mature secondary vegetation_Minimal use" = "MSV", #since there is only this category now, no other intensities
+                                    "Intermediate secondary vegetation_Minimal use" = "ISVMU",
+                                    "Intermediate secondary vegetation_LightIntense" = "ISVHU",
+                                    "Young secondary vegetation_Minimal use" = "YSVMU",
+                                    "Young secondary vegetation_LightIntense" = "YSVHU",
+                                    "Plantation forest_Minimal use" = "PFMU",
+                                    "Plantation forest_LightIntense" = "PFHU",
+                                    "Pasture" = "P",
+                                    "Cropland" = "C"
+                                    )))
+```
+
+### reorder the factor levels
+```{r}
+#first get a list of the levels
+levels(NeoAntSites$LUI)
+
+#recode the levels
+NeoAntSites$LUI <- factor(NeoAntSites$LUI, levels = c("PV", "MSV", "ISVMU", "ISVHU", "YSVMU", "YSVHU", "PFMU", "PFHU", "P", "C"))
+
+#check it worked
+levels(NeoAntSites$LUI)
+```
+
+### Check to see how many sites we have in each category. There are at least 30, so the data spread should be ok
+```{r}
+table(NeoAntSites$LUI)
+```
+
+### Create the model data frames
+```{r}
+#ant model data, abundance 
+model_data_ant_ab <- drop_na(NeoAntSites,
+                             RescaledAbundance, Predominant_land_use, Use_intensity, LUI)
+
+#ant log and sqrt abundances
+model_data_ant_ab <- mutate(model_data_ant_ab, 
+                        logAbundance = log(RescaledAbundance + 1),
+                        sqrtAbundance = sqrt(RescaledAbundance))
+
+## ant species richness data
+model_data_ant_sr <- drop_na(NeoAntSites,
+                             SpeciesRichness, Predominant_land_use, Use_intensity, LUI)
+```
+
+### Check the number of sources, studies, and sites in the model data
+```{r}
+#ants
+length(unique(model_data_ant_sr$Source_ID)) #number of sources
+length(unique(model_data_ant_sr$SS)) #number of studies
+length(unique(model_data_ant_sr$SSBS)) #number of sites
+```
+
+### Reorder the factor levels for the model ant datasets
+Reorder the levels so that visualisation is more clear (not always necessary but in case the model data gets messed up)
+```{r}
+### ANTS
+
+#abundance
+
+    #reorder abundance LUI levels
+    model_data_ant_ab$LUI <- factor(model_data_ant_ab$LUI, levels = c("PV", "MSV", "ISVMU", "ISVHU", "YSVMU", "YSVHU", "PFMU", "PFHU", "P", "C"))
+
+    #reorder abundance Predominant land use levels
+    model_data_ant_ab$Predominant_land_use <- factor(model_data_ant_ab$Predominant_land_use, levels = c("Primary vegetation", "Mature secondary vegetation", "Intermediate secondary vegetation", "Young secondary vegetation", "Plantation forest", "Pasture", "Cropland"))
+
+    #reorder abundance Use intensity levels
+    model_data_ant_ab$Use_intensity <- factor(model_data_ant_ab$Use_intensity, levels = c("Minimal use", "Light use", "Intense use"))
+
+#species richness
+
+    #reorder Species richness LUI levels
+    model_data_ant_sr$LUI <- factor(model_data_ant_sr$LUI, levels = c("PV", "MSV", "ISVMU", "ISVHU", "YSVMU", "YSVHU", "PFMU", "PFHU", "P", "C"))
+
+    #reorder Species richness Predominant land use levels
+    model_data_ant_sr$Predominant_land_use <- factor(model_data_ant_sr$Predominant_land_use, levels = c("Primary vegetation", "Mature secondary vegetation", "Intermediate secondary vegetation", "Young secondary vegetation", "Plantation forest", "Pasture", "Cropland"))
+
+    #reorder Species richness Use intensity levels
+    model_data_ant_sr$Use_intensity <- factor(model_data_ant_sr$Use_intensity, levels = c("Minimal use", "Light use", "Intense use"))
+```
+
+The ant abundance dataframe is a bit shorter than the SR dataframe. Check the data spread in the abundance one to see if it is even
+### Check the abundance dataframe data spread
+```{r}
+## Check LUI spread
+table(model_data_ant_ab$LUI)
+
+## Check land use spread
+table(model_data_ant_ab$Predominant_land_use)
+```
+
+Unfortunately the abundance data is pretty sparse in some areas, but it makes sense because a lot of ant measurements tend to be occurrence measurements rather than abundance ones. Because of the imbalance here, I don't think I will be able to use MSV unless I collapsed the vegetation together.
+
+The SR dataframe is the same length as the ants one, so the data spread should be even there.
+
+# MODELLING
+
+### Create models of Species richness 
+
+### Create the maximal model and proceed with backwards stepwise selection
+```{r}
+## Create the maximal model
+m1s <- glmer(SpeciesRichness ~ LUI + (1|SS) + (1|SSB), 
+            data = model_data_ant_sr,
+            family = "poisson")
+
+## Remove block as random effect
+m2s <- glmer(SpeciesRichness ~ LUI + (1|SS), 
+            data = model_data_ant_sr,
+            family = "poisson")
+
+## Remove study as random effect
+m3s <- glmer(SpeciesRichness ~ LUI + (1|SSB), 
+            data = model_data_ant_sr,
+            family = "poisson",
+            control = glmerControl(optimizer = "bobyqa"))
+
+## Compare the random effects structure of the model
+AIC(m1s, m2s, m3s)
+anova(m1s, m2s, m3s)
+
+## Model m1s is the best random effect structure, so keep that.
+
+## Compare the first model to an intercept only model of Species richness
+m4s <- glmer(SpeciesRichness ~ (1|SS) + (1|SSB), 
+            data = model_data_ant_sr,
+            family = "poisson")
+
+## Check which model fits better
+anova(m1s, m4s)
+model.sel(m1s, m4s)
+
+## It seems that model m1s is the best model.
+summary(m1s)
+```
+
+### Validate the model, check diagnostics of model m1s
+```{r}
+## run the model function
+model_plot(m1s)
+
+## Simulate the residuals of the model using DHARMa
+m1s_residuals <- simulateResiduals(fittedModel = m4s, plot = F)
+
+## Plot them
+plot(m1s_residuals)
+
+## Test the outliers and test for dispersion
+testOutliers(m1s_residuals)
+testDispersion(m1s_residuals)
+
+## Test for overdispersion
+overdisp_fun(m1s)
+```
+
+Model m1s diagnostic plots look ok, and there is no overdispersion
+### Check the summary statistics and significance of terms
+```{r}
+summary(m1s)
+Anova(m1s)
+```
+
+This seems to be the best model, and I might want to make alterations to it though.
+
+Now I want to extract the effect estimates of the model and plot them so I can visualize how the LUI is affecting ant species richness.
+
+### Simulate the effects of the ant SR model to generate figures
+```{r}
+# gather the effects and confidence intervals using simulation. Simulate 1000 times
+ant_sr_eff <- FEsim(m1s, 1000)
+
+# make the term column a factor so it can be recoded
+ant_sr_eff$term <- as.factor(ant_sr_eff$term)
+
+# recode the factors to make them shorter (so I can visualise easier)
+ant_sr_eff$term <- recode_factor(ant_sr_eff$term, "(Intercept)" = "PV", 
+                              "LUIMSV" = "MSV", 
+                              "LUIISVMU" = "ISVMU", 
+                              "LUIISVHU" = "ISVHU", 
+                              "LUIYSVMU" = "YSVMU", 
+                              "LUIYSVHU" = "YSVHU", 
+                              "LUIPFMU" = "PFMU", 
+                              "LUIPFHU" = "PFHU", 
+                              "LUIP" = "P", 
+                              "LUIC" = "C")
+
+# Add in upper and lower confidence intervals 
+ant_sr_eff <- ant_sr_eff %>%
+  mutate(Upper_ci = (median + 1.96*sd)) %>%
+  mutate(Lower_ci = (median - 1.96*sd))
+
+# Generate percentage differences from the baseline (first term, Primary Vegetation (PV))
+ant_sr_eff <- ant_sr_eff %>%
+ mutate(
+    Percent_diff = ((((exp(median[1] + median)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_upper = ((((exp(median[1] + Upper_ci)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_lower = ((((exp(median[1] + Lower_ci)) / exp(median[1]))*100)-100))
+
+# Shift the baseline down to 0
+ant_sr_eff[1,7] <- 0 #shift median
+ant_sr_eff[1,8] <- 0 #shift upper
+ant_sr_eff[1,9] <- 0 #shift lower
+
+# Rename the sim eff term column name to LUI for joining
+colnames(ant_sr_eff)[1] <- "LUI"
+
+# Left join the sim eff to the model data to make graphing easier
+model_data_ant_sr_plot <- left_join(model_data_ant_sr, ant_sr_eff)
+```
+
+### Plot the effect estimates 
+```{r}
+## Plot the effect estimate as the percent species richness difference from primary vegetation
+ant_species_richness <- model_data_ant_sr_plot %>%
+  ggplot()+
+  aes(x = LUI, y = Percent_diff, ymin = Percent_lower, ymax = Percent_upper)+
+  geom_hline(yintercept = 0, size = 0.75, color = ("black"), linetype = 1 )+
+  geom_point(size = 2)+
+  geom_linerange(aes(ymin = Percent_lower, ymax = Percent_upper), size = 0.75)+
+  theme_classic()+
+  theme(axis.text.x = element_text(face= "bold", angle = 45, hjust = 1),
+        legend.title = element_blank(),
+        legend.position = "none",
+        axis.title.x = element_blank(),
+        panel.border = element_rect(colour = "black",  fill=NA),
+        axis.title.y = element_text(face = "bold"),
+        plot.title = element_text(face = "bold"))+
+  xlab("Land use intensity class")+
+  ylab("Species richness difference (%)")+
+  theme(legend.position = "none") 
+ant_species_richness
+```
+This should be the graph that I use for the fine scale ant species richness. In terms of writing it up:
+
+Figure X: Ant species richness response to land use intensity (LUI) in the Neotropics
+Error bars show the 95% confidence interval around each estimate. Error bars that do not cross zero are statistically significantly different from primary vegetation. Colors represent the following land use types: black (primary vegetation, PV), orange (mature secondary vegetation, MSV), light blue (intermediate secondary vegetation, ISV), green (young secondary vegetation, YSV), yellow (plantation forest, PF), dark blue (pasture), dark orange (cropland). N = 948 observations
+
+
+### ant effects dataframe
+```{r}
+write.csv(ant_sr_eff, "Ant_species_richness_effects.csv")
+```
+
+### Export the graph
+```{r}
+ant_species_richness_plot <- ggarrange(ant_species_richness, ant_species_richness,
+          ncol = 1, nrow = 2)
+ant_species_richness_plot
+
+ggexport(ant_species_richness_plot, "ant_broad_SR_plot.pdf")
+```

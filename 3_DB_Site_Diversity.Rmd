@@ -1,0 +1,760 @@
+---
+title: "3_DB_site_diversity"
+author: "Alex Dhond"
+date: "7/26/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This script is for testing Dung beetle site biodiversity metrics on their own. In the combined dataset, I was not able to get a fine scale look at the Land use intensity classes due to imbalances between ants and dung beetles. In this script, I want to model dung beetle abundance and species richness as a response to land use intensity (which I will create as a new variable).
+
+Because the Simpson's diversity requires me to make a matrix, I have done that in a separate script (script 3a), and the modelling for Simpson's index in script 3b. Since I will be plotting Simpson's together with the abundance and species richness, I have also made a separate script for the plotting (see script 3c).
+
+### For clearing the workspace prior to running
+```{r}
+rm(list=ls())
+```
+
+### Load the required packages
+```{r}
+## Data manipulation ## 
+library(dplyr) # data manipulation
+library(tidyr) # data manipulation
+
+## Modelling ## 
+library(lme4) # creating mixed effects models
+library(car) # for LRT / anova comparisons
+library(merTools) # for extracting model estimates
+library(MuMIn) # for assessing model fit
+library(optimx) #optimizing models
+library(DHARMa) #for model validation
+
+## Plotting ## 
+library(ggplot2) # basic plotting package
+library(ggpubr) # for arranging and exporting plots
+library(cowplot) # for arranging and exporting plots
+```
+
+### Load in any required functions
+```{r}
+## Load in the source function for checking GVIFs - for collinearity
+source("https://highstat.com/Books/Book2/HighstatLibV10.R")
+
+## Load in a model criticism function - this function is used for checking the residual/model diagnostic plots to test that the model is meeting all of its assumptions
+model_plot <-function(mod.for.plot){
+  require(lattice)
+  
+  # set up a 2 x 2 grid for plotting
+  par(mfrow = c(1,3))
+  par(ask = TRUE)
+  
+  # qqplot
+  qqnorm(resid(mod.for.plot))
+  qqline(resid(mod.for.plot), col = 2)
+  
+  # residuals vs fitted plot
+  plot(fitted(mod.for.plot), resid(mod.for.plot),xlab = "Fitted Values", ylab = "Residuals", main = "Residuals vs fitted")
+  abline(h=0, lty=2)
+  lines(smooth.spline(fitted(mod.for.plot), resid(mod.for.plot)), col = "red")
+  
+  # histogram of residuals
+  hist(resid(mod.for.plot))
+  
+  # random effects distribution
+  dotplot(ranef(mod.for.plot,condVar = TRUE))
+}
+
+## Load in an overdispersion function from this website to help test if the models are overdispersed.
+# https://bbolker.github.io/mixedmodels-misc/glmmFAQ.html#testing-for-overdispersioncomputing-overdispersion-factor
+overdisp_fun <- function(model) {
+    rdf <- df.residual(model)
+    rp <- residuals(model,type="pearson")
+    Pearson.chisq <- sum(rp^2)
+    prat <- Pearson.chisq/rdf
+    pval <- pchisq(Pearson.chisq, df=rdf, lower.tail=FALSE)
+    c(chisq=Pearson.chisq,ratio=prat,rdf=rdf,p=pval)
+}
+```
+
+### Load in a colour palette (for the figures)
+```{r}
+## Load in a color palette
+cbbPalette <- c("#000000", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+```
+
+### First read in the Dung beetle data
+```{r}
+NeoDungBeetles <- read.csv("NeoDungBeetles.csv")
+```
+
+# Calculate broad site level diversity metrics - abundance and species richness
+The Dung beetle data in the Neotropics is mainly abundance data, so I can calculate site level abundance and species richness estimates
+
+### Create Neo dung beetle sites
+```{r}
+NeoDungBeetleSites <- NeoDungBeetles %>%
+
+  # pull out only the merged diversity data
+  distinct(merge_ID, .keep_all = TRUE) %>%
+  
+  # re-make SSB and SSBS values since we've now dropped a bunch of values
+  mutate(SS = paste(Source_ID, Study_number),
+         SSB = paste(SS, Block),
+         SSBS = paste(SSB, Site_number)) %>%
+  
+  # group by SSBS (each unique value corresponds to a unique site)
+  group_by(SSBS) %>%
+  
+  # now add up all the abundance measurements within each site
+  mutate(TotalAbundance = ifelse(Diversity_metric_type == "Abundance",
+                                 sum(merged_diversity),
+                                 # if the diversity metric type isn't Abundance, then leave the TotalAbundance measurement as NA
+                                 NA),
+         
+         # if the metric is already species richness
+         SpeciesRichness = ifelse(Diversity_metric_type == "Species richness",
+                                  # just use the value as given
+                                  merged_diversity,
+                                  # for abundance and occurrence measurements, count the number of unique species names that are present at the site 
+                                  n_distinct(Taxon_name_entered[merged_diversity > 0])),
+         
+         # calculate Chao's Species Richness Estimator
+         # if the diversity metric is suitable for this calculation
+         ChaoRichness = ifelse(Diversity_metric_is_suitable_for_Chao == TRUE,
+                               # calculate the Chao estimator
+                               sum(merged_diversity > 0) + (((sum(merged_diversity == 1) * (sum(merged_diversity == 1)-1)) / (2*(sum(merged_diversity == 2)+1)))),
+                               # otherwise give Chao NA
+                               NA)
+         ) %>%
+  
+  # ungroup
+  ungroup() %>%
+  
+    # now group by Study ID
+  group_by(SS) %>%
+  
+  # pull out some useful study-level numbers
+  # maximum abundance for each study
+  mutate(MaxAbundance = max(TotalAbundance),
+         # minimum (non-zero) abundance for each study
+         # we'll use this when we do species rarefaction
+         MinNonZeroAbundance = min(TotalAbundance[TotalAbundance > 0]),
+         # number of species in the study
+         SpeciesInStudy = n_distinct(Taxon_name_entered[merged_diversity > 0]),
+         # assess whether the study is suitable for rarefaction
+         SuitableForRarefaction = ifelse(
+           # if all diversity measurements are integers
+           # i.e. if you round down, it should be equal to the original number
+           # and the diversity metric is suitable for Chao
+           all(floor(merged_diversity) == merged_diversity) &
+             Diversity_metric_is_suitable_for_Chao == TRUE,
+           # then class the study as suitable for rarefaction
+           TRUE,
+           # otherwise it can't be used
+           FALSE
+           )
+         ) %>%
+  
+  # ungroup
+  ungroup()  %>%
+  
+  # now rescale total abundance, so that within each study, abundance varies from 0 to 1.
+  mutate(RescaledAbundance = TotalAbundance/MaxAbundance,
+         # for statistical modelling, we'll also calculate the square root of species abundance, although we might want to use log(x+1) transformation instead
+         sqrtRescaledAbundance = sqrt(RescaledAbundance),
+         logRescaledAbundance = log(RescaledAbundance + 1)
+         )
+
+# pull out unique sites
+NeoDungBeetleSites <- NeoDungBeetleSites %>%
+  distinct(SSBS, .keep_all = TRUE)
+```
+
+### check the number of sources, studies, and sites
+```{r}
+#dung beetles
+length(unique(NeoDungBeetleSites$Source_ID)) #number of sources
+length(unique(NeoDungBeetleSites$SS)) #number of studies
+length(unique(NeoDungBeetleSites$SSBS)) #number of sites
+```
+
+### Look at the site data, and collapse variables with little/no data
+Here I am removing collapsing primary vegetation, removing the indeterminate as well as cannot decide categories, and removing urban as a category
+```{r}
+NeoDungBeetleSites <- NeoDungBeetleSites %>%
+  
+  mutate(
+
+    #collapse primary vegetation together
+    Predominant_land_use = recode_factor(Predominant_land_use, 
+                                  "Primary forest" = "Primary vegetation", 
+                                  "Primary non-forest" = "Primary vegetation"),
+    
+    # indeterminate secondary veg and cannot decide get NA
+    Predominant_land_use = na_if(Predominant_land_use, "Secondary vegetation (indeterminate age)"),
+    Predominant_land_use = na_if(Predominant_land_use, "Cannot decide"),
+    Use_intensity = na_if(Use_intensity, "Cannot decide"),
+
+  )
+
+#remove urban sites
+NeoDungBeetleSites <- droplevels(subset(NeoDungBeetleSites, Predominant_land_use != "Urban"))
+
+# take another look at the LandUse/Use intensity split
+table(NeoDungBeetleSites$Predominant_land_use, NeoDungBeetleSites$Use_intensity) 
+```
+
+### Collapse all data in which there are 30 or less observations per land use/intensity combination.
+30 observations will be the cut off point. Here I am collapsing land use intensities together to make sure there is an even enough data spread.
+```{r}
+NeoDungBeetleSites <- NeoDungBeetleSites %>%
+  mutate(LUI = interaction(Predominant_land_use, Use_intensity, sep = "_"),
+         
+         #collapse primary vegetation Light Intense together
+         LUI = recode_factor(LUI, "Primary vegetation_Light use" = "Primary vegetation_LightIntense", "Primary vegetation_Intense use" = "Primary vegetation_LightIntense"),
+         
+         #collapse Cropland Intense and Light together, save as "LightIntense"
+         LUI = recode_factor(LUI, "Cropland_Intense use" = "Cropland_LightIntense",
+                             "Cropland_Light use" = "Cropland_LightIntense"),
+         
+         #collapse Mature Secondary Vegetation Intense and Light into "LightIntense"
+         LUI = recode_factor(LUI, 
+                             "Mature secondary vegetation_Minimal use" = "Mature secondary vegetation",
+                             "Mature secondary vegetation_Intense use" = "Mature secondary vegetation", 
+                             "Mature secondary vegetation_Light use" = "Mature secondary vegetation"),
+         
+         #collapse plantation forest intense and light together
+         LUI = recode_factor(LUI, "Plantation forest_Intense use" = "Plantation forest",
+                             "Plantation forest_Light use" = "Plantation forest",
+                             "Plantation forest_Minimal use" = "Plantation forest"),
+         
+         #collapse Intermediate secondary vegetation light and intense together
+         LUI = recode_factor(LUI, "Intermediate secondary vegetation_Intense use" = "Intermediate secondary vegetation", "Intermediate secondary vegetation_Light use" = "Intermediate secondary vegetation",
+                             "Intermediate secondary vegetation_Minimal use" = "Intermediate secondary vegetation"),
+         
+         #collapse Young secondary vegetation light and intense together
+         LUI = recode_factor(LUI, "Young secondary vegetation_Light use" = "Young secondary vegetation", "Young secondary vegetation_Intense use" = "Young secondary vegetation",
+                             "Young secondary vegetation_Minimal use" = "Young secondary vegetation"),
+
+         #dont collapse pasture
+  )
+
+table(NeoDungBeetleSites$LUI)
+table(NeoDungBeetleSites$Predominant_land_use, NeoDungBeetleSites$Use_intensity)
+```
+
+### Recode these factor levels for easier visualization on graphs
+```{r}
+#LightIntense use category will be classified as "Higher (H)" use for brevity
+NeoDungBeetleSites <- NeoDungBeetleSites %>%
+  mutate(LUI = plyr::revalue(LUI, c("Primary vegetation_Minimal use" = "PVMU",
+                                    "Primary vegetation_LightIntense" = "PVHU",
+                                    "Mature secondary vegetation" = "MSV",
+                                    "Intermediate secondary vegetation" = "ISV",
+                                    "Young secondary vegetation" = "YSV",
+                                    "Plantation forest" = "PF",
+                                    "Pasture_Minimal use" = "PMU",
+                                    "Pasture_Light use" = "PLU",
+                                    "Pasture_Intense use" = "PIU",
+                                    "Cropland_Minimal use" = "CMU",
+                                    "Cropland_LightIntense" = "CHU")))
+```
+
+### Reorder factor levels so that PVMU is the baseline for modelling (and graphing)
+```{r}
+#first get a list of the levels
+levels(NeoDungBeetleSites$LUI)
+
+#recode the levels
+NeoDungBeetleSites$LUI <- factor(NeoDungBeetleSites$LUI, levels = c("PVMU", "PVHU", "MSV", "ISV", "YSV", "PF", "PMU", "PLU", "PIU", "CMU", "CHU"))
+
+#check it worked
+levels(NeoDungBeetleSites$LUI)
+```
+
+### Make model dataframes
+```{r}
+## dung beetle model data, abundance and SR
+model_data_db_ab <- drop_na(NeoDungBeetleSites, 
+                         RescaledAbundance, Predominant_land_use, Use_intensity, LUI)
+model_data_db_sr <- drop_na(NeoDungBeetleSites, 
+                         SpeciesRichness, Predominant_land_use, Use_intensity, LUI)
+
+### create alternative abundance metrics
+
+#dung beetle log and sqrt abundances
+model_data_db_ab <- mutate(model_data_db_ab, 
+                        logAbundance = log(RescaledAbundance + 1),
+                        sqrtAbundance = sqrt(RescaledAbundance))
+```
+
+### Reorder the model data into the same levels as the abundance data
+This may not be a necessary step - however I noticed when I was initially running the code that sometimes the model data gets messed up - best to keep it in any ways to check
+```{r}
+### DUNG BEETLES
+
+# ABUNDANCE
+#reorder levels for abundance LUI
+model_data_db_ab$LUI <- factor(model_data_db_ab$LUI, levels = c("PVMU", "PVHU", "MSV", "ISV", "YSV", "PF", "PMU", "PLU", "PIU", "CMU", "CHU"))
+
+#reorder levels for predominant land use 
+model_data_db_ab$Predominant_land_use <- factor(model_data_db_ab$Predominant_land_use, levels = c("Primary vegetation", "Mature secondary vegetation", "Intermediate secondary vegetation", "Young secondary vegetation", "Plantation forest", "Pasture", "Cropland"))
+
+
+# SPECIES RICHNESS
+#reorder levels for Species richness LUI
+model_data_db_sr$LUI <- factor(model_data_db_sr$LUI, levels = c("PVMU", "PVHU", "MSV", "ISV", "YSV", "PF", "PMU", "PLU", "PIU", "CMU", "CHU"))
+
+#predominant land use
+model_data_db_sr$Predominant_land_use <- factor(model_data_db_sr$Predominant_land_use, levels = c("Primary vegetation", "Mature secondary vegetation", "Intermediate secondary vegetation", "Young secondary vegetation", "Plantation forest", "Pasture", "Cropland"))
+```
+
+### Write the model dataframes as csv so I can easily load it
+```{r}
+write.csv(model_data_db_ab, "DB_ab_model_data.csv")
+```
+
+
+# MODELLING 
+
+## ABUNDANCE
+Now I can move on to modelling the more fine LUI for dung beetles. I will start with the abundance models.
+
+### Create maximal model for dung beetle abundance vs LUI and begin with backwards stepwise selection
+```{r}
+## Sqrt abundance models -make maximal model
+m1 <- lmer(sqrtAbundance ~ LUI + (1|SS) + (1|SSB), data = model_data_db_ab)
+
+## Remove block as random effect
+m2 <- lmer(sqrtAbundance ~ LUI + (1|SS), data = model_data_db_ab)
+
+## remove study as random effect
+m3 <- lmer(sqrtAbundance ~ LUI + (1|SSB), data = model_data_db_ab)
+
+## Check the AIC values of these models to see the best random effects structure
+AIC(m1,m2,m3)
+
+## Model m1 has the lowest AIC and is therefore the random effects structure is the best.
+
+## Proceed with removing the fixed effects - create a null model
+m4 <- lmer(sqrtAbundance ~ (1|SS) + (1|SSB), data = model_data_db_ab)
+
+## Compare the models
+anova(m1, m4)
+model.sel(m1, m4)
+AIC(m1, m4)
+
+## Model m1 is better, so that fixed effect structure is the best
+
+## test the LUI model against a model of land use 
+m5 <- lmer(sqrtAbundance ~ Predominant_land_use + (1|SS) + (1|SSB), data = model_data_db_ab)
+
+## compare the models
+anova(m1, m5)
+anova(m5)
+Anova(m5)
+Anova(m1)
+## So LUI vs predominant land use are not significantly different from one another. I will keep LUI as that is the variable I am trying to look at.
+```
+
+### Create log abundance model for dung beetle vs LUI, proceed with backwards stepwise selection
+```{r}
+## Sqrt abundance models -make maximal model
+m1a <- lmer(logAbundance ~ LUI + (1|SS) + (1|SSB), data = model_data_db_ab)
+
+## Remove block as random effect
+m2a <- lmer(logAbundance ~ LUI + (1|SS), data = model_data_db_ab)
+
+## remove study as random effect
+m3a <- lmer(logAbundance ~ LUI + (1|SSB), data = model_data_db_ab)
+
+## Check the AIC values of these models to see the best random effects structure
+AIC(m1a,m2a,m3a)
+
+## Model m1a has the lowest AIC and is therefore the random effects structure is the best.
+
+## Proceed with removing the fixed effects - create a null model
+m4a <- lmer(logAbundance ~ (1|SS) + (1|SSB), data = model_data_db_ab)
+
+## Compare the models
+anova(m1a, m4a)
+model.sel(m1a, m4a)
+AIC(m1a, m4a)
+
+## Model m1a is better, so that fixed effect structure is the best
+
+## test the LUI model against a model of land use 
+m5a <- lmer(logAbundance ~ Predominant_land_use + (1|SS) + (1|SSB), data = model_data_db_ab)
+
+## compare the models
+anova(m1a, m5a)
+
+## So LUI vs predominant land use are not significantly different from one another. I will keep LUI as that is the variable I am trying to look at.
+```
+
+Models m1 (sqrt) and m1a (log) were significantly better than the others. Time for model validation
+
+### Check model diagnostics for model m4 (sqrt abundance)
+```{r}
+## Check the residuals using the model_plot function
+model_plot(m1)
+
+## Simulate the residuals of the model using DHARMa
+m1_residuals <- simulateResiduals(fittedModel = m1, plot = F)
+
+## Plot them
+plot(m1_residuals)
+
+## Test the outliers and test for dispersion
+testOutliers(m1_residuals)
+testDispersion(m1_residuals)
+```
+
+### Check model diagnostics for model m1a (log abundance)
+```{r}
+## Check the residuals using the model_plot function
+model_plot(m1a)
+
+## Simulate the residuals of the model using DHARMa
+m1a_residuals <- simulateResiduals(fittedModel = m1a, plot = F)
+
+## Plot them
+plot(m1a_residuals)
+
+## Test the outliers and test for dispersion
+testOutliers(m1a_residuals)
+testDispersion(m1a_residuals)
+```
+
+The sqrt abundance model residual plots look better than the log + 1 model. So I will probably use that 
+Now time to move on to species richness.
+
+### get summary of sqrt abundance model
+```{r}
+summary(m1)
+Anova(m1)
+```
+
+
+## SPECIES RICHNESS
+
+### Create the maximal model and proceed with backwards stepwise selection
+```{r}
+## Create the maximal model
+m1s <- glmer(SpeciesRichness ~ LUI + (1|SS) + (1|SSB), 
+            data = model_data_db_sr,
+            family = "poisson")
+
+## Remove block as random effect
+m2s <- glmer(SpeciesRichness ~ LUI + (1|SS), 
+            data = model_data_db_sr,
+            family = "poisson")
+
+## Remove study as random effect
+m3s <- glmer(SpeciesRichness ~ LUI +(1|SSB), 
+            data = model_data_db_sr,
+            family = "poisson",
+            control = glmerControl(optimizer = "bobyqa"))
+
+## Compare the random effects structure of the model
+AIC(m1s, m2s, m3s)
+anova(m1s, m2s, m3s)
+
+## Model m1s is the best random effect structure, so keep that.
+
+## Compare the first model to an intercept only model of Species richness
+m4s <- glmer(SpeciesRichness ~ (1|SS) + (1|SSB), 
+            data = model_data_db_sr,
+            family = "poisson")
+
+## Check which model fits better
+anova(m1s, m4s)
+model.sel(m1s, m4s)
+
+## It seems that model m1s is the best model.
+summary(m1s)
+```
+
+Time for model validation. 
+
+### Validate the model, check diagnostics of model m1s
+```{r}
+## run the model function
+model_plot(m1s)
+
+## Simulate the residuals of the model using DHARMa
+m1s_residuals <- simulateResiduals(fittedModel = m4s, plot = F)
+
+## Plot them
+plot(m1s_residuals)
+
+## Test the outliers and test for dispersion
+testOutliers(m1s_residuals)
+testDispersion(m1s_residuals)
+
+## Test for overdispersion
+overdisp_fun(m1s)
+```
+
+The overdispersion test for this model was significant, so there is overdispersion in the model. I will add a site level random effect (SSBS) to account for this overdispersion
+
+### Create a model with SSBS as an extra random effect
+```{r}
+## Add SSBS as random effect
+m5s <- glmer(SpeciesRichness ~ LUI + (1|SS) + (1|SSB) + (1|SSBS), 
+            data = model_data_db_sr,
+            family = "poisson")
+
+## Check the diagnostic plots for this model
+model_plot(m5s)
+
+## Simulate the residuals of the model using DHARMa
+m5s_residuals <- simulateResiduals(fittedModel = m4s, plot = F)
+
+## Plot them
+plot(m5s_residuals)
+
+## Test the outliers and test for dispersion
+testOutliers(m5s_residuals)
+testDispersion(m5s_residuals)
+
+## Test for overdispersion
+overdisp_fun(m5s)
+```
+
+Adding in SSBS as an extra random effect fixed the overdispersion. Model m5s will be the species richness model I use to make plots
+
+### check the model summary
+```{r}
+summary(m5s)
+Anova(m5s)
+```
+
+
+Now onto visualizing the model.
+
+
+# ABUNDANCE MODEL VISUALIZATION
+
+Simulate the effects of the dung beetle abundance models to generate figures
+
+### Simulate the sqrt abundance model
+```{r}
+# gather the effects and confidence intervals using simulation. Simulate 1000 times
+db_ab1_eff <- FEsim(m1, 1000)
+
+# make the term column a factor so it can be recoded
+db_ab1_eff$term <- as.factor(db_ab1_eff$term)
+
+# recode the factors to make them shorter (so I can visualise easier)
+db_ab1_eff$term <- recode_factor(db_ab1_eff$term, "(Intercept)" = "PVMU",
+                              "LUIPVHU" = "PVHU",   
+                              "LUIMSV" = "MSV", 
+                              "LUIISV" = "ISV", 
+                              "LUIYSV" = "YSV", 
+                              "LUIPF" = "PF", 
+                              "LUIPMU" = "PMU", 
+                              "LUIPLU" = "PLU", 
+                              "LUIPIU" = "PIU",
+                              "LUICMU" = "CMU",
+                              "LUICHU" = "CHU")
+
+# Add in upper and lower confidence intervals 
+db_ab1_eff <- db_ab1_eff %>%
+  mutate(Upper_ci = (median + 1.96*sd)) %>%
+  mutate(Lower_ci = (median - 1.96*sd))
+
+# Back transform the sqrt abundance estimates so that I get a measure of abundance
+db_ab1_eff <- db_ab1_eff %>%
+  mutate(
+    Percent_diff = ((((median[1] + median)^2) / (median[1])^2)*100)-100) %>%
+  mutate(
+    Percent_upper = (((median[1] + Upper_ci)^2) / ((median[1])^2) * 100) - 100) %>%
+  mutate(
+    Percent_lower = ((((median[1] + Lower_ci)^2) / ((median[1])^2) * 100) - 100)
+  )
+
+# Shift the baseline down to 0
+db_ab1_eff[1,7] <- 0 #shift median
+db_ab1_eff[1,8] <- 0 #shift upper
+db_ab1_eff[1,9] <- 0 #shift lower 
+
+# Rename the sim eff term column name to LUI for joining
+colnames(db_ab1_eff)[1] <- "LUI"
+
+# Left join the sim eff to the model data to make graphing easier
+model_data_db_ab_plot <- left_join(model_data_db_ab, db_ab1_eff)
+```
+
+### Plot the effect estimates 
+```{r}
+## Plot the effect estimate as the percent species richness difference from primary vegetation
+DB_sqrt_abundance_plot <- model_data_db_ab_plot %>%
+  ggplot()+
+  aes(x = LUI, y = Percent_diff, colour = Predominant_land_use)+
+  geom_point(size = 2)+
+  geom_errorbar(aes(ymin = Percent_lower, ymax = Percent_upper), size = 0.75, width = 0.2)+
+  geom_hline(yintercept = 0, size = I(1), color = I("black"), linetype = 1 )+
+  theme_light()+
+  theme(axis.text.x = element_text(colour = c("#000000", "#000000", "#E69F00", "#56B4E9", "#009E73",  "#F0E442", "#0072B2", "#0072B2", "#0072B2","#D55E00", "#D55E00"), face= "bold", angle = 45, hjust = 1),
+        axis.title.x = element_blank())+
+  ylab("Total abundance difference (%)")+
+  scale_colour_manual(values=cbbPalette)+
+  theme(legend.position = "none")
+DB_sqrt_abundance_plot
+```
+Figure X: Dung beetle sqrt abundance response to land use intensity (LUI) in the Neotropics
+Error bars show the 95% confidence interval around each estimate. Error bars that do not cross zero are statistically significantly different from primary vegetation minimal use. Colors represent the following land use types: black (primary vegetation, PV), orange (mature secondary vegetation, MSV), light blue (intermediate secondary vegetation, ISV), green (young secondary vegetation, YSV), yellow (plantation forest, PF), dark blue (pasture), dark orange (cropland). N = 995 observations
+
+### Simulate the log abundance model
+```{r}
+# gather the effects and confidence intervals using simulation. Simulate 1000 times
+db_ab2_eff <- FEsim(m1a, 1000)
+
+# make the term column a factor so it can be recoded
+db_ab2_eff$term <- as.factor(db_ab2_eff$term)
+
+# recode the factors to make them shorter (so I can visualise easier)
+db_ab2_eff$term <- recode_factor(db_ab2_eff$term, "(Intercept)" = "PVMU",
+                              "LUIPVHU" = "PVHU",   
+                              "LUIMSV" = "MSV", 
+                              "LUIISV" = "ISV", 
+                              "LUIYSV" = "YSV", 
+                              "LUIPF" = "PF", 
+                              "LUIPMU" = "PMU", 
+                              "LUIPLU" = "PLU", 
+                              "LUIPIU" = "PIU",
+                              "LUICMU" = "CMU",
+                              "LUICHU" = "CHU")
+
+# Add in upper and lower confidence intervals 
+db_ab2_eff <- db_ab2_eff %>%
+  mutate(Upper_ci = (median + 1.96*sd)) %>%
+  mutate(Lower_ci = (median - 1.96*sd))
+
+# Back transform the log abundance estimates so that I get a measure of abundance
+db_ab2_eff <- db_ab2_eff %>%
+  mutate(
+    Percent_diff = (((exp(median[1] + median) - 1) / (exp(median[1]) - 1))*100)-100) %>%
+  mutate(
+    Percent_upper = (((exp(median[1] + Upper_ci) - 1) / (exp(median[1]) - 1)) * 100) - 100) %>%
+  mutate(
+    Percent_lower = (((exp(median[1] + Lower_ci) - 1) / (exp(median[1]) - 1)) * 100) - 100)
+
+# Shift the baseline down to 0
+db_ab2_eff[1,7] <- 0 #shift median
+db_ab2_eff[1,8] <- 0 #shift upper
+db_ab2_eff[1,9] <- 0 #shift lower
+
+# Rename the sim eff term column name to LUI for joining
+colnames(db_ab2_eff)[1] <- "LUI"
+
+# Left join the sim eff to the model data to make graphing easier
+model_data_db_ab_plot2 <- left_join(model_data_db_ab, db_ab2_eff)
+```
+
+### Plot the effect estimates 
+```{r}
+## Plot the effect estimate as the percent species richness difference from primary vegetation
+DB_log_abundance_plot <- model_data_db_ab_plot2 %>%
+  ggplot()+
+  aes(x = LUI, y = Percent_diff, colour = Predominant_land_use)+
+  geom_point(size = 2)+
+  geom_errorbar(aes(ymin = Percent_lower, ymax = Percent_upper), size = 0.75, width = 0.2)+
+  geom_hline(yintercept = 0, size = I(1), color = I("black"), linetype = 1 )+
+  theme_light()+
+  theme(axis.text.x = element_text(colour = c("#000000", "#000000", "#E69F00", "#56B4E9", "#009E73",  "#F0E442", "#0072B2", "#0072B2", "#0072B2","#D55E00", "#D55E00"), face= "bold", angle = 45, hjust = 1),
+        axis.title.x = element_blank())+
+  xlab("Land use intensity class")+
+  ylab("Total abundance difference (%)")+
+  scale_colour_manual(values=cbbPalette)+
+  theme(legend.position = "none")
+DB_log_abundance_plot
+```
+Figure X: (LOG) Dung beetle total abundance response to land use intensity (LUI) in the Neotropics.
+Error bars show the 95% confidence interval around each estimate. Error bars that do not cross zero are statistically significantly different from primary vegetation minimal use. Colors represent the following land use types: black (primary vegetation, PV), orange (mature secondary vegetation, MSV), light blue (intermediate secondary vegetation, ISV), green (young secondary vegetation, YSV), yellow (plantation forest, PF), dark blue (pasture), dark orange (cropland). N = 995 observations
+
+# SPECIES RICHNESS VISUALIZATION
+
+### Simulate the dung beetle species richness model
+```{r}
+# gather the effects and confidence intervals using simulation. Simulate 1000 times
+db_sr_eff <- FEsim(m5s, 1000)
+
+# make the term column a factor so it can be recoded
+db_sr_eff$term <- as.factor(db_sr_eff$term)
+
+# recode the factors to make them shorter (so I can visualise easier)
+db_sr_eff$term <- recode_factor(db_sr_eff$term, "(Intercept)" = "PVMU",
+                              "LUIPVHU" = "PVHU",   
+                              "LUIMSV" = "MSV", 
+                              "LUIISV" = "ISV", 
+                              "LUIYSV" = "YSV", 
+                              "LUIPF" = "PF", 
+                              "LUIPMU" = "PMU", 
+                              "LUIPLU" = "PLU", 
+                              "LUIPIU" = "PIU",
+                              "LUICMU" = "CMU",
+                              "LUICHU" = "CHU")
+
+# Add in upper and lower confidence intervals 
+db_sr_eff <- db_sr_eff %>%
+  mutate(Upper_ci = (median + 1.96*sd)) %>%
+  mutate(Lower_ci = (median - 1.96*sd))
+
+# Generate percentage differences from the baseline (first term, Primary Vegetation (PV))
+db_sr_eff <- db_sr_eff %>%
+ mutate(
+    Percent_diff = ((((exp(median[1] + median)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_upper = ((((exp(median[1] + Upper_ci)) / exp(median[1]))*100)-100)) %>%
+  mutate(
+    Percent_lower = ((((exp(median[1] + Lower_ci)) / exp(median[1]))*100)-100))
+
+# Shift the baseline down to 0
+db_sr_eff[1,7] <- 0 #shift median
+db_sr_eff[1,8] <- 0 #shift upper
+db_sr_eff[1,9] <- 0 #shift lower
+
+# Rename the sim eff term column name to LUI for joining
+colnames(db_sr_eff)[1] <- "LUI"
+
+# Left join the sim eff to the model data to make graphing easier
+model_data_db_sr_plot <- left_join(model_data_db_sr, db_sr_eff)
+```
+
+### Plot the effect estimates 
+```{r}
+## Plot the effect estimate as the percent species richness difference from primary vegetation
+DB_sr_plot <- model_data_db_sr_plot %>%
+  ggplot()+
+  aes(x = LUI, y = Percent_diff, colour = Predominant_land_use)+
+  geom_point(size = 2)+
+  geom_errorbar(aes(ymin = Percent_lower, ymax = Percent_upper), size = 0.75, width = 0.2)+
+  geom_hline(yintercept = 0, size = I(1), color = I("black"), linetype = 1 )+
+  theme_light()+
+  theme(axis.text.x = element_text(colour = c("#000000", "#000000", "#E69F00", "#56B4E9", "#009E73",  "#F0E442", "#0072B2", "#0072B2", "#0072B2","#D55E00", "#D55E00"), face= "bold", angle = 45, hjust = 1),
+        axis.title.x = element_blank())+
+  xlab("Land use intensity class")+
+  ylab("Species richness difference (%)")+
+  scale_colour_manual(values=cbbPalette)+
+  theme(legend.position = "none")
+DB_sr_plot
+```
+Figure X: Dung beetle species richness response to land use intensity (LUI) in the Neotropics
+Error bars show the 95% confidence interval around each estimate. Error bars that do not cross zero are statistically significantly different from primary vegetation minimal use. Colors represent the following land use types: black (primary vegetation, PV), orange (mature secondary vegetation, MSV), light blue (intermediate secondary vegetation, ISV), green (young secondary vegetation, YSV), yellow (plantation forest, PF), dark blue (pasture), dark orange (cropland). N = 995 observations
+
+
+### Save the model dataframes with which I made the graphs for a separate plotting script
+```{r}
+## Sqrt abundance
+write.csv(model_data_db_ab_plot, "DB_abundance_data_for_plots.csv")
+
+## Species richness
+write.csv(model_data_db_sr_plot, "DB_species_richness_data_for_plots.csv")
+```
+
+I have saved the model data separately as I want to combine all the graphs together - I also might want to change how they look, so it is easier to do it this way.

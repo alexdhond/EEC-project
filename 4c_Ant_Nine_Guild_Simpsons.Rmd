@@ -1,0 +1,357 @@
+---
+title: "4c_Ant_Nine_Guild_Simpsons"
+author: "Alex Dhond"
+date: "8/17/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This script is for calculating Simpson's diversity of the nine trophic guilds, which gives me a measure of the effective number of trophic guilds represented at a site or land use. In this script I also model and plot the output
+
+### For clearing the workspace prior to running
+```{r}
+rm(list=ls())
+```
+
+### Load the required packages
+```{r}
+## Data manipulation ## 
+library(dplyr) # data manipulation
+library(tidyr) # data manipulation
+library(vegan) # calculating simpsons index
+
+## Modelling ## 
+library(lme4) # creating mixed effects models
+library(car) # for LRT / anova comparisons
+library(merTools) # for extracting model estimates
+library(MuMIn) # for assessing model fit
+library(optimx) #optimizing models
+library(DHARMa) #for model validation
+
+## Plotting ## 
+library(ggplot2) # basic plotting package
+library(ggpubr) # for arranging and exporting plots
+library(cowplot) # for arranging and exporting plots
+```
+
+### Load in any required functions
+```{r}
+## Load in a model criticism function - this function is used for checking the residual/model diagnostic plots to test that the model is meeting all of its assumptions
+model_plot <-function(mod.for.plot){
+  require(lattice)
+  
+   # set up a 2 x 2 grid for plotting
+  par(mfrow = c(1,3))
+  par(ask = TRUE) 
+  
+  # qqplot
+  qqnorm(resid(mod.for.plot))
+  qqline(resid(mod.for.plot), col = 2)
+  
+  # residuals vs fitted plot
+  plot(fitted(mod.for.plot), resid(mod.for.plot),xlab = "Fitted Values", ylab = "Residuals", main = "Residuals vs fitted")
+  abline(h=0, lty=2)
+  lines(smooth.spline(fitted(mod.for.plot), resid(mod.for.plot)), col = "red")
+  
+  # histogram of residuals
+  hist(resid(mod.for.plot))
+  
+  # random effects distribution
+  dotplot(ranef(mod.for.plot,condVar = TRUE))
+}
+```
+
+### Read in the 9 tier ant simpson model data
+```{r}
+nine_trophic_tier_model_ant_sr <- read.csv("9_guild_ant_model_sr.csv")
+```
+
+### Create a new dataframe for Simpson's diversity where I can extract the guilds and the sites
+
+There are a few things to note here: 
+1. I first need to get rid of all the sites where there are no species of any guild (ie zeroes across the entire matrix) as these are completely uninformative
+
+2. Next, I need to remove all rows where there is only 1 species of each guild at a site. These singleton sites are also uninformative because I do not have any abundance data, so I do not know if there is actually complete dominance at this site (which is what it would indicate)
+
+```{r}
+## When I group by SSBS and Guild, it gives me the number of species in each guild at each site. So, at a given site, I could have X number of Predators, Y number of Omnivores, and Z number of Herbivorous ants. 
+
+## create initial dataframe
+Simpson_df <- nine_trophic_tier_model_ant_sr %>%
+  dplyr::select(SSBS, SpeciesRichness, Guild)
+
+## make it wide data so each guild is its own column
+Simpson_df_9_tier <- Simpson_df %>%
+  pivot_wider(names_from = Guild, values_from = SpeciesRichness)
+
+## remove NAs
+Simpson_df_9_tier[is.na(Simpson_df_9_tier)] <- 0
+
+## make site a factor
+Simpson_df_9_tier$SSBS <- as.factor(Simpson_df_9_tier$SSBS)
+
+## Create a dataframe where all of the sites that did not contain any of the three guilds are excluded
+Simp_zeros_removed <- Simpson_df_9_tier %>%
+  filter(`Arboreal omnivores` != 0 | `Ground-dwelling generalist predators` != 0 | `Ground-dwelling specialist predators` != 0 | `Ground-dwelling omnivores` != 0 | `Raid-hunting predators` !=0 | `Leaf-cutters` !=0 | `Cryptobiotic attines` != 0 | `Arboreal predators` !=0 | `Generalist omnivores` != 0)
+
+948 - 912
+## Removed 36 rows where there was nothing
+
+## Create a dataframe where all of the sites that had only 1 guild at them are also excluded.
+Simp_no_ones_zeros <- Simpson_df_9_tier %>%
+  
+  ## where they are all 0
+  filter(`Arboreal omnivores` != 0 | `Ground-dwelling generalist predators` != 0 | `Ground-dwelling specialist predators` != 0 | `Ground-dwelling omnivores` != 0 | `Raid-hunting predators` !=0 | `Leaf-cutters` !=0 | `Cryptobiotic attines` != 0 | `Arboreal predators` !=0 | `Generalist omnivores` != 0) %>%
+  
+  ## where arboreal omnivores are the only one
+  filter(`Arboreal omnivores` != 1 | `Ground-dwelling generalist predators` != 0 | `Ground-dwelling specialist predators` != 0 | `Ground-dwelling omnivores` != 0 | `Raid-hunting predators` !=0 | `Leaf-cutters` !=0 | `Cryptobiotic attines` != 0 | `Arboreal predators` !=0 | `Generalist omnivores` != 0) %>%
+  
+  ## where gen pred are the only 1
+  filter(`Arboreal omnivores` != 0 | `Ground-dwelling generalist predators` != 1 | `Ground-dwelling specialist predators` != 0 | `Ground-dwelling omnivores` != 0 | `Raid-hunting predators` !=0 | `Leaf-cutters` !=0 | `Cryptobiotic attines` != 0 | `Arboreal predators` !=0 | `Generalist omnivores` != 0) %>%
+  
+  ## when spec pred are the only 1
+  filter(`Arboreal omnivores` != 0 | `Ground-dwelling generalist predators` != 0 | `Ground-dwelling specialist predators` != 1 | `Ground-dwelling omnivores` != 0 | `Raid-hunting predators` !=0 | `Leaf-cutters` !=0 | `Cryptobiotic attines` != 0 | `Arboreal predators` !=0 | `Generalist omnivores` != 0) %>%
+  
+  ## when ground omnivores are the only 1
+  filter(`Arboreal omnivores` != 0 | `Ground-dwelling generalist predators` != 0 | `Ground-dwelling specialist predators` != 0 | `Ground-dwelling omnivores` != 1 | `Raid-hunting predators` !=0 | `Leaf-cutters` !=0 | `Cryptobiotic attines` != 0 | `Arboreal predators` !=0 | `Generalist omnivores` != 0) %>%
+  
+  ## when RHP are the only 1
+  filter(`Arboreal omnivores` != 0 | `Ground-dwelling generalist predators` != 0 | `Ground-dwelling specialist predators` != 0 | `Ground-dwelling omnivores` != 0 | `Raid-hunting predators` !=1 | `Leaf-cutters` !=0 | `Cryptobiotic attines` != 0 | `Arboreal predators` !=0 | `Generalist omnivores` != 0) %>%
+  
+  ## when LC are the only one 
+  filter(`Arboreal omnivores` != 0 | `Ground-dwelling generalist predators` != 0 | `Ground-dwelling specialist predators` != 0 | `Ground-dwelling omnivores` != 0 | `Raid-hunting predators` !=0 | `Leaf-cutters` !=1 | `Cryptobiotic attines` != 0 | `Arboreal predators` !=0 | `Generalist omnivores` != 0) %>%
+  
+  ## where CA are the only 1
+  filter(`Arboreal omnivores` != 0 | `Ground-dwelling generalist predators` != 0 | `Ground-dwelling specialist predators` != 0 | `Ground-dwelling omnivores` != 0 | `Raid-hunting predators` !=0 | `Leaf-cutters` !=0 | `Cryptobiotic attines` != 1 | `Arboreal predators` !=0 | `Generalist omnivores` != 0) %>%
+  
+  ## where Ap are the one
+  filter(`Arboreal omnivores` != 0 | `Ground-dwelling generalist predators` != 0 | `Ground-dwelling specialist predators` != 0 | `Ground-dwelling omnivores` != 0 | `Raid-hunting predators` !=0 | `Leaf-cutters` !=0 | `Cryptobiotic attines` != 0 | `Arboreal predators` !=1 | `Generalist omnivores` != 0) %>%
+  
+  ## where GO are the one
+  filter(`Arboreal omnivores` != 0 | `Ground-dwelling generalist predators` != 0 | `Ground-dwelling specialist predators` != 0 | `Ground-dwelling omnivores` != 0 | `Raid-hunting predators` !=0 | `Leaf-cutters` !=0 | `Cryptobiotic attines` != 0 | `Arboreal predators` !=0 | `Generalist omnivores` != 1)
+  
+  
+948 - 877
+## This removes 71 rows, where there was only 1 species of each guild present at the site
+
+## I want to only look at simpsons inverse index
+
+#generate inverse simpsons index  for larger dataset
+inv_simp_all <- plyr::ddply(Simpson_df_9_tier, ~SSBS, function(x) {
+  data.frame(INVSIMPSON=diversity(x[-1], index="invsimpson"))
+})
+
+## generate inv simpson for no zeros dataset
+inv_simp_no_zero <- plyr::ddply(Simp_zeros_removed, ~SSBS, function(x) {
+  data.frame(INVSIMPSON=diversity(x[-1], index="invsimpson"))
+})
+
+## generate inv simpson for no ones or zeros dataset
+inv_simp_no_one_zero <- plyr::ddply(Simp_no_ones_zeros, ~SSBS, function(x) {
+  data.frame(INVSIMPSON=diversity(x[-1], index="invsimpson"))
+})
+
+## Add in log + 1 metrics in case of non-normality
+inv_simp_all$LOGINVSIMPSON <- log(inv_simp_all$INVSIMPSON + 1)
+inv_simp_no_zero$LOGINVSIMPSON <- log(inv_simp_no_zero$INVSIMPSON + 1)
+inv_simp_no_one_zero$LOGINVSIMPSON <- log(inv_simp_no_one_zero$INVSIMPSON + 1)
+```
+
+### Left join Simpson's back into the model data
+```{r}
+## join by SSBS
+
+## no zeros data set 
+model_sr_no_zero <- left_join(nine_trophic_tier_model_ant_sr, inv_simp_no_zero)
+
+## no zeros or ones data set
+model_9_tier_sr_no_one_no_zero <- left_join(nine_trophic_tier_model_ant_sr, inv_simp_no_one_zero)
+```
+
+### Clean up the no ones or zeros dataset
+```{r}
+## Drop all NAs from relevant modelling columns
+model_9_tier_sr_no_one_no_zero <- drop_na(model_9_tier_sr_no_one_no_zero, 
+                                   Predominant_land_use, LUI, INVSIMPSON, LOGINVSIMPSON)
+
+## Relevel LUI factors 
+model_9_tier_sr_no_one_no_zero$LUI <- factor(model_9_tier_sr_no_one_no_zero$LUI, levels = c("PV", "MSV", "ISVMU", "ISVHU", "YSVMU", "YSVHU", "PFMU", "PFHU", "P", "C"))
+
+## Relevel land use factors
+model_9_tier_sr_no_one_no_zero$Predominant_land_use <- factor(model_9_tier_sr_no_one_no_zero$Predominant_land_use, levels = c("Primary vegetation", "Mature secondary vegetation", "Intermediate secondary vegetation", "Young secondary vegetation", "Plantation forest", "Pasture", "Cropland"))
+```
+
+
+# MODEL 1 - no zeros or ones
+
+### Model the no ones or zeros dataset with no log transformation
+```{r}
+## Make maximal model and do backwards stepwise selection
+modsimp1 <- lmer(INVSIMPSON ~ LUI + (1|SS) + (1|SSB), data = model_9_tier_sr_no_one_no_zero)
+
+## only study as random effect
+modsimp2 <- lmer(INVSIMPSON ~ LUI + (1|SS), data = model_9_tier_sr_no_one_no_zero)
+
+## block as random effect
+modsimp3 <- lmer(INVSIMPSON ~ LUI + (1|SSB), data = model_9_tier_sr_no_one_no_zero)
+
+## compare random effects structure
+AIC(modsimp1, modsimp2, modsimp3)
+model.sel(modsimp1, modsimp2, modsimp3)
+
+## Intercept only model with study and block as random effect
+modsimp4 <- lmer(INVSIMPSON ~ (1|SS) + (1|SSB), data = model_9_tier_sr_no_one_no_zero)
+
+## compare it to null model
+AIC(modsimp1, modsimp4)
+
+## model 1 seems to be the best
+```
+
+### Check the model diagnostic plots
+Model modelsimp1 is the best - look at diagnostic plots
+```{r}
+## run the model function
+model_plot(modsimp1)
+
+## Simulate the residuals of the model using DHARMa
+modsimp1_residuals <- simulateResiduals(fittedModel = modsimp1, plot = F)
+
+## Plot them
+plot(modsimp1_residuals)
+
+## Test the outliers and test for dispersion
+testOutliers(modsimp1_residuals)
+testDispersion(modsimp1_residuals)
+```
+
+It looks ok, now I will make the log transformed models as well
+### Create log transformed models as well to improve normality
+```{r}
+## Make maximal model and do backwards stepwise selection
+modsimp5 <- lmer(LOGINVSIMPSON ~ LUI + (1|SS) + (1|SSB), data = model_9_tier_sr_no_one_no_zero)
+
+## only study as random effect
+modsimp6 <- lmer(LOGINVSIMPSON ~ LUI + (1|SS), data = model_9_tier_sr_no_one_no_zero)
+
+## block as random effect
+modsimp7 <- lmer(LOGINVSIMPSON ~ LUI + (1|SSB), data = model_9_tier_sr_no_one_no_zero)
+
+## compare random effects structure
+AIC(modsimp5, modsimp6, modsimp7)
+model.sel(modsimp5, modsimp6, modsimp7)
+
+## Intercept only model with study and block as random effect
+modsimp8 <- lmer(LOGINVSIMPSON ~ (1|SS) + (1|SSB), data = model_9_tier_sr_no_one_no_zero)
+
+## compare it to null model
+AIC(modsimp5, modsimp10)
+AIC(modsimp9, modsimp10)
+Anova(modsimp5)
+## model 5 seems to be the best
+```
+
+### Check model diagnostics for model 5
+```{r}
+## run the model function
+model_plot(modsimp5)
+
+## Simulate the residuals of the model using DHARMa
+modsimp5_residuals <- simulateResiduals(fittedModel = modsimp5, plot = F)
+
+## Plot them
+plot(modsimp5_residuals)
+
+## Test the outliers and test for dispersion
+testOutliers(modsimp5_residuals)
+testDispersion(modsimp5_residuals)
+```
+
+Log transforming normalizes it a little bit, but not by much. I will keep the log transformed version
+
+### Gather the estimates and significance of terms
+```{r}
+Anova(modsimp5)
+summary(modsimp5)
+```
+
+### Gather the effects and plot the log transformed model
+```{r}
+# gather the effects and confidence intervals using simulation. Simulate 1000 times
+simp_9_eff_1 <- FEsim(modsimp5, 1000)
+
+# make the term column a factor so it can be recoded
+simp_9_eff_1$term <- as.factor(simp_9_eff_1$term)
+
+# recode the factors to make them shorter (so I can visualise easier)
+simp_9_eff_1$term <- recode_factor(simp_9_eff_1$term, "(Intercept)" = "PV", 
+                              "LUIMSV" = "MSV", 
+                              "LUIISVMU" = "ISVMU", 
+                              "LUIISVHU" = "ISVHU", 
+                              "LUIYSVMU" = "YSVMU", 
+                              "LUIYSVHU" = "YSVHU", 
+                              "LUIPFMU" = "PFMU", 
+                              "LUIPFHU" = "PFHU", 
+                              "LUIP" = "P", 
+                              "LUIC" = "C")
+
+# Add in upper and lower confidence intervals 
+simp_9_eff_1 <- simp_9_eff_1 %>%
+  mutate(Upper_ci = (median + 1.96*sd)) %>%
+  mutate(Lower_ci = (median - 1.96*sd))
+
+# Back transform the log simpson estimates so that I get actual values
+simp_9_eff_1 <- simp_9_eff_1 %>%
+ mutate(
+    Percent_diff = ((((exp(median[1] + median) - 1) / (exp(median[1]) - 1))*100)-100)) %>%
+  mutate(
+    Percent_upper = ((((exp(median[1] + Upper_ci) - 1) / (exp(median[1]) - 1))*100)-100)) %>%
+  mutate(
+    Percent_lower = ((((exp(median[1] + Lower_ci) - 1) / (exp(median[1]) - 1))*100)-100))
+
+# Shift the baseline down to 0
+simp_9_eff_1[1,7] <- 0 #shift median
+simp_9_eff_1[1,8] <- 0 #shift upper
+simp_9_eff_1[1,9] <- 0 #shift lower
+
+# Rename the sim eff term column name to LUI for joining
+colnames(simp_9_eff_1)[1] <- "LUI"
+
+# Left join the sim eff to the model data to make graphing easier
+simp_eff_1_plot <- left_join(model_9_tier_sr_no_one_no_zero, simp_9_eff_1)
+```
+
+### Create the x-axis labels
+```{r}
+X_Limits <- c("PV", "MSV", "ISVMU", "ISVHU", "YSVMU", "YSVHU", "PFMU", "PFHU", "P", "C")
+```
+
+### Plot the nine guild simpsons diversity
+```{r}
+guild_9_tier_simpson <- simp_eff_1_plot %>%
+  ggplot()+
+  aes(x = LUI, y = Percent_diff, ymin = Percent_lower, ymax = Percent_upper)+
+  geom_hline(yintercept = 0, size = 0.75, color = ("black"), linetype = 1 )+
+  geom_point(size = 2, position = position_dodge(width = 0.5))+
+  geom_linerange(aes(ymin = Percent_lower, ymax = Percent_upper), position = position_dodge(width=0.5), size = 0.75)+
+  theme_classic()+
+  theme(axis.text.x = element_text(face= "bold", angle = 45, hjust = 1),
+        legend.title = element_blank(),
+        legend.position = "none",
+        axis.title.x = element_blank(),
+        panel.border = element_rect(colour = "black",  fill=NA),
+        axis.title.y = element_text(face = "bold"))+
+  xlab("Land use intensity class")+
+  ylab("Simpson's diversity difference (%)")
+guild_9_tier_simpson
+```
+### Export the plot
+```{r}
+## Export the graph
+simpson_nine_tier_plot <- ggarrange(guild_9_tier_simpson, guild_9_tier_simpson,
+                    ncol = 1, nrow = 2)
+ggexport(simpson_nine_tier_plot, filename = "simpson_nine_tier_plot.pdf")
+```

@@ -1,0 +1,337 @@
+---
+title: "3a_DB_Simpsons_Index"
+author: "Alex Dhond"
+date: "8/4/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This script is for calculating Simpson's diversity index for the dung beetle sites in my dataset. The actual modelling of Simpson's diversity comes in the next script (script 3b)
+
+### For clearing the workspace prior to running
+```{r}
+rm(list=ls())
+```
+
+### Load the required packages
+```{r}
+## Data manipulation ## 
+library(dplyr) # data manipulation
+library(tidyr) # data manipulation
+library(vegan) # for calculating Simpson's index
+```
+
+### First read in the Dung beetle data
+```{r}
+NeoDungBeetles <- read.csv("NeoDungBeetles.csv")
+```
+
+### For Simpson's diversity index, I need a measure of the abundance of unique dung beetle species at each site
+```{r}
+## Remove rows where there is no genus information (this should have been done already in the first script, but just to check again)
+NeoDungBeetleSpecies <- droplevels(subset(NeoDungBeetles, Genus != ""))
+
+# Create a new GenusSpecies column, where if the species name is unknown, it will put in the genus name instead.
+NeoDungBeetleSpecies <- NeoDungBeetleSpecies %>%
+  mutate(GenusSpecies = ifelse(Best_guess_binomial == "", paste(Genus), paste(Best_guess_binomial)))
+```
+
+### Generate the abundance of each species at each site
+```{r}
+NeoDungBeetleSpecies <- NeoDungBeetleSpecies %>%
+
+  # pull out only the merged diversity data
+  distinct(merge_ID, .keep_all = TRUE) %>%
+  
+  # re-make SSB and SSBS values since we've now dropped a bunch of values
+  mutate(SS = paste(Source_ID, Study_number),
+         SSB = paste(SS, Block),
+         SSBS = paste(SSB, Site_number)) %>%
+  
+  # group by SSBS (each unique value corresponds to a unique site)
+  group_by(SSBS, GenusSpecies) %>%
+  
+  # now add up all the abundance measurements within each site
+  mutate(TotalAbundance = ifelse(Diversity_metric_type == "Abundance",
+                                 sum(merged_diversity),
+                                 # if the diversity metric type isn't Abundance, then leave the TotalAbundance measurement as NA
+                                 NA),
+         
+         # if the metric is already species richness
+         SpeciesRichness = ifelse(Diversity_metric_type == "Species richness",
+                                  # just use the value as given
+                                  merged_diversity,
+                                  # for abundance and occurrence measurements, count the number of unique species names that are present at the site 
+                                  n_distinct(Taxon_name_entered[merged_diversity > 0])),
+         
+         # calculate Chao's Species Richness Estimator
+         # if the diversity metric is suitable for this calculation
+         ChaoRichness = ifelse(Diversity_metric_is_suitable_for_Chao == TRUE,
+                               # calculate the Chao estimator
+                               sum(merged_diversity > 0) + (((sum(merged_diversity == 1) * (sum(merged_diversity == 1)-1)) / (2*(sum(merged_diversity == 2)+1)))),
+                               # otherwise give Chao NA
+                               NA)
+         ) %>%
+  
+  # ungroup
+  ungroup() %>%
+  
+    # now group by Study ID
+  group_by(SS, GenusSpecies) %>%
+  
+  # pull out some useful study-level numbers
+  # maximum abundance for each study
+  mutate(MaxAbundance = max(TotalAbundance),
+         # number of species in the study
+         SpeciesInStudy = n_distinct(Taxon_name_entered[merged_diversity > 0]),
+         # assess whether the study is suitable for rarefaction
+         SuitableForRarefaction = ifelse(
+           # if all diversity measurements are integers
+           # i.e. if you round down, it should be equal to the original number
+           # and the diversity metric is suitable for Chao
+           all(floor(merged_diversity) == merged_diversity) &
+             Diversity_metric_is_suitable_for_Chao == TRUE,
+           # then class the study as suitable for rarefaction
+           TRUE,
+           # otherwise it can't be used
+           FALSE
+           )
+         ) %>%
+  
+  # ungroup
+  ungroup()  %>%
+  
+  # now rescale total abundance, so that within each study, abundance varies from 0 to 1.
+  mutate(RescaledAbundance = TotalAbundance/MaxAbundance,
+         # for statistical modelling, we'll also calculate the square root of species abundance, although we might want to use log(x+1) transformation instead
+         sqrtRescaledAbundance = sqrt(RescaledAbundance),
+         logRescaledAbundance = log(RescaledAbundance + 1)
+         )
+NeoDungBeetleSpecies <- NeoDungBeetleSpecies %>%
+  distinct(SSBS, GenusSpecies, .keep_all = TRUE)
+```
+
+
+Within the NeoDungBeetleSpecies dataframe, the "TotalAbundance" column gives the total abundance of that particular species at that site. The "SpeciesRichness" column gives either a 0 or 1 depending on if that species is present or absent - this is useful in terms of generating a presence absence dataframe
+
+I now need to collapse the land use intensities in the same way that I did the dung beetle sites data (script 3) so that I can compare Simpson's to species richness
+
+### Look at the site data, and collapse variables with little/no data
+```{r}
+NeoDungBeetleSpecies <- NeoDungBeetleSpecies %>%
+  
+  mutate(
+
+    #collapse primary vegetation together
+    Predominant_land_use = recode_factor(Predominant_land_use, 
+                                  "Primary forest" = "Primary vegetation", 
+                                  "Primary non-forest" = "Primary vegetation"),
+    
+    # indeterminate secondary veg and cannot decide get NA
+    Predominant_land_use = na_if(Predominant_land_use, "Secondary vegetation (indeterminate age)"),
+    Predominant_land_use = na_if(Predominant_land_use, "Cannot decide"),
+    Use_intensity = na_if(Use_intensity, "Cannot decide"),
+
+  )
+
+#remove urban sites
+NeoDungBeetleSpecies <- droplevels(subset(NeoDungBeetleSpecies, Predominant_land_use != "Urban"))
+
+# take another look at the LandUse/Use intensity split
+table(NeoDungBeetleSpecies$Predominant_land_use, NeoDungBeetleSpecies$Use_intensity) 
+```
+
+### Collapse the land use categories further
+```{r}
+NeoDungBeetleSpecies <- NeoDungBeetleSpecies %>%
+  mutate(LUI = interaction(Predominant_land_use, Use_intensity, sep = "_"),
+         
+         #collapse primary vegetation Light Intense together
+         LUI = recode_factor(LUI, "Primary vegetation_Light use" = "Primary vegetation_LightIntense", "Primary vegetation_Intense use" = "Primary vegetation_LightIntense"),
+         
+         #collapse Cropland Intense and Light together, save as "LightIntense"
+         LUI = recode_factor(LUI, "Cropland_Intense use" = "Cropland_LightIntense",
+                             "Cropland_Light use" = "Cropland_LightIntense"),
+         
+         #collapse Mature Secondary Vegetation Intense and Light into "LightIntense"
+         LUI = recode_factor(LUI, 
+                             "Mature secondary vegetation_Minimal use" = "Mature secondary vegetation",
+                             "Mature secondary vegetation_Intense use" = "Mature secondary vegetation", 
+                             "Mature secondary vegetation_Light use" = "Mature secondary vegetation"),
+         
+         #collapse plantation forest intense and light together
+         LUI = recode_factor(LUI, "Plantation forest_Intense use" = "Plantation forest",
+                             "Plantation forest_Light use" = "Plantation forest",
+                             "Plantation forest_Minimal use" = "Plantation forest"),
+         
+         #collapse Intermediate secondary vegetation light and intense together
+         LUI = recode_factor(LUI, "Intermediate secondary vegetation_Intense use" = "Intermediate secondary vegetation", "Intermediate secondary vegetation_Light use" = "Intermediate secondary vegetation",
+                             "Intermediate secondary vegetation_Minimal use" = "Intermediate secondary vegetation"),
+         
+         #collapse Young secondary vegetation light and intense together
+         LUI = recode_factor(LUI, "Young secondary vegetation_Light use" = "Young secondary vegetation", "Young secondary vegetation_Intense use" = "Young secondary vegetation",
+                             "Young secondary vegetation_Minimal use" = "Young secondary vegetation"),
+
+         #dont collapse pasture
+  )
+
+table(NeoDungBeetleSpecies$LUI)
+table(NeoDungBeetleSpecies$Predominant_land_use, NeoDungBeetleSpecies$Use_intensity)
+```
+
+### reorder the LUI factor levels for easier visualization
+```{r}
+#LightIntense use category will be classified as "Higher (H)" use for brevity
+NeoDungBeetleSpecies <- NeoDungBeetleSpecies %>%
+  mutate(LUI = plyr::revalue(LUI, c("Primary vegetation_Minimal use" = "PVMU",
+                                    "Primary vegetation_LightIntense" = "PVHU",
+                                    "Mature secondary vegetation" = "MSV",
+                                    "Intermediate secondary vegetation" = "ISV",
+                                    "Young secondary vegetation" = "YSV",
+                                    "Plantation forest" = "PF",
+                                    "Pasture_Minimal use" = "PMU",
+                                    "Pasture_Light use" = "PLU",
+                                    "Pasture_Intense use" = "PIU",
+                                    "Cropland_Minimal use" = "CMU",
+                                    "Cropland_LightIntense" = "CHU")))
+```
+
+### reorder LUI factor levels
+```{r}
+#first get a list of the levels
+levels(NeoDungBeetleSpecies$LUI)
+
+#recode the levels
+NeoDungBeetleSpecies$LUI <- factor(NeoDungBeetleSpecies$LUI, levels = c("PVMU", "PVHU", "MSV", "ISV", "YSV", "PF", "PMU", "PLU", "PIU", "CMU", "CHU"))
+
+#check it worked
+levels(NeoDungBeetleSpecies$LUI)
+```
+
+### Do the same for the predominant land use categories
+First revalue/relabel the land use categories so that graphs are easier to read. Then recode the levels so that when modelling they appear with primary vegetation as the reference level (and on graphs they go in an intuitive order)
+```{r}
+## Revalue the factors
+NeoDungBeetleSpecies <- NeoDungBeetleSpecies %>%
+  mutate(Predominant_land_use = plyr::revalue(Predominant_land_use, c("Primary vegetation" = "Primary",
+                                    "Mature secondary vegetation" = "MSV",
+                                    "Intermediate secondary vegetation" = "ISV",
+                                    "Young secondary vegetation" = "YSV",
+                                    "Plantation forest" = "Plantation",
+                                    "Pasture" = "Pasture",
+                                    "Cropland" = "Cropland")))
+
+## Check to see the names are new
+table(NeoDungBeetleSpecies$Predominant_land_use)
+
+## Now re-code the levels
+levels(NeoDungBeetleSpecies$Predominant_land_use)
+
+#recode the levels
+NeoDungBeetleSpecies$Predominant_land_use <- factor(NeoDungBeetleSpecies$Predominant_land_use, levels = c("Primary", "MSV", "ISV", "YSV", "Plantation", "Pasture", "Cropland"))
+
+#check it worked
+levels(NeoDungBeetleSpecies$Predominant_land_use)
+```
+
+### make model data and visualise
+```{r}
+#dung beetle model data, abundance and SR
+model_data_simp_db_ab <- drop_na(NeoDungBeetleSpecies, 
+                         RescaledAbundance, Predominant_land_use, Use_intensity, LUI)
+
+#dung beetle log and sqrt abundances
+model_data_simp_db_ab <- mutate(model_data_simp_db_ab, 
+                        logAbundance = log(RescaledAbundance + 1),
+                        sqrtAbundance = sqrt(RescaledAbundance))
+
+# species richness
+model_data_simp_db_sr <- drop_na(NeoDungBeetleSpecies, 
+                         SpeciesRichness, Predominant_land_use, Use_intensity, LUI)
+```
+
+### reorder the model data into the same levels as the abundance data
+```{r}
+### DUNG BEETLES
+
+# ABUNDANCE
+#reorder levels for abundance LUI
+model_data_simp_db_ab$LUI <- factor(model_data_simp_db_ab$LUI, levels = c("PVMU", "PVHU", "MSV", "ISV", "YSV", "PF", "PMU", "PLU", "PIU", "CMU", "CHU"))
+
+#reorder levels for abundance Predominant land use
+model_data_simp_db_ab$Predominant_land_use <- factor(model_data_simp_db_ab$Predominant_land_use, levels = c("Primary vegetation", "Mature secondary vegetation", "Intermediate secondary vegetation", "Young secondary vegetation", "Plantation forest", "Pasture", "Cropland"))
+
+#reorder levels for abundance Use intensity
+model_data_simp_db_ab$Use_intensity <- factor(model_data_simp_db_ab$Use_intensity, levels = c("Minimal use", "Light use", "Intense use"))
+
+# SPECIES RICHNESS
+
+#reorder levels for Species richness LUI
+model_data_simp_db_sr$LUI <- factor(model_data_simp_db_sr$LUI, levels = c("PVMU", "PVHU", "MSV", "ISV", "YSV", "PF", "PMU", "PLU", "PIU", "CMU", "CHU"))
+
+#reorder levels for Species richness Predominant land use
+model_data_simp_db_sr$Predominant_land_use <- factor(model_data_simp_db_sr$Predominant_land_use, levels = c("Primary vegetation", "Mature secondary vegetation", "Intermediate secondary vegetation", "Young secondary vegetation", "Plantation forest", "Pasture", "Cropland"))
+
+#reorder levels for Species Richness Use intensity
+model_data_simp_db_sr$Use_intensity <- factor(model_data_simp_db_sr$Use_intensity, levels = c("Minimal use", "Light use", "Intense use"))
+```
+
+Now I should be able to calculate Simpson's index (normal and inverse) for all of the sites in my Dung beetles dataset. Here I will calculate both indices for each site, then left join them back into the larger dataset so that each site gets a measure of Simpson's diversity.
+
+## Calculate Simpson's diversity index for dung beetles
+```{r}
+## create initial dataframe of all the species and their abundances at the site
+Simpson_df <- model_data_simp_db_ab %>%
+  dplyr::select(SSBS, GenusSpecies, TotalAbundance)
+
+## make it wide data so each species is its own column
+Simpson_matrix <- Simpson_df %>%
+  pivot_wider(names_from = GenusSpecies, values_from = TotalAbundance)
+
+## remove NAs
+Simpson_matrix[is.na(Simpson_matrix)] <- 0
+
+## make site a factor
+Simpson_matrix$SSBS <- as.factor(Simpson_matrix$SSBS)
+
+#generate inverse simpsons index
+DB_inv_simp <- plyr::ddply(Simpson_matrix, ~SSBS, function(x) {
+  data.frame(INVSIMPSON=diversity(x[-1], index="invsimpson"))
+})
+```
+
+Now I have the values for Simpson's diversity index as well as the Inverse Simpson's diversity index, however in the inverse diversity index there are NAs and Infinite values. I need to remove all the sites where there are no species present as that is what is creating an error in the index.
+
+### Remove all the 0s
+```{r}
+## Remove all rows where the sum of the abundances is not greater than zero (ie there are no species in that row)
+Simp_fixed <- Simpson_matrix[rowSums(Simpson_matrix[2:406])>0,]
+995-924
+## It removed 71 rows
+
+#generate inverse simpsons index
+Simp_inv_fixed_results <- plyr::ddply(Simp_fixed, ~SSBS, function(x) {
+  data.frame(INVSIMPSON=diversity(x[-1], index="invsimpson"))
+})
+
+## make a log transformed column
+Simp_inv_fixed_results$LOGINVSIMPSON <- log(Simp_inv_fixed_results$INVSIMPSON + 1)
+
+```
+
+I now have a dataframe with the Inverse Simpson's diversity index for all of the dung beetle sites in my analysis. I need to now left join this with the model data in order to be able to compare models.
+
+### Save as a csv file for easier loading
+```{r}
+write.csv(Simp_inv_fixed_results, "DB_Simpson_short.csv")
+```
+
+
+This script calculated inverse simpsons index for the dung beetle sites at which there was at least 1 species sampled.
+
+
+
+

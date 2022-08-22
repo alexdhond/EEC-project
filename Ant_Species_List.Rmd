@@ -1,0 +1,40 @@
+---
+title: "Ant_Species_List"
+author: "Alex Dhond"
+date: "7/25/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+In this script I will create and export a list of all the ant genus and species so that I can classify them according to trophic classifications
+
+# 1. For Ants:
+  + Generate a list of all the ant species present at the Neotropical sites I am looking at
+  + Take this list, export it as an Excel file or CSV, and then match the Genus/Species to the trophic guild categorization of Groc et al. 2014
+
+### Read in the ant data
+```{r}
+NeoAnts <- read.csv("NeoAnts.csv")
+```
+
+### Remove where there is no genera information and create new column
+```{r}
+## drop missing genera information
+NeoAnts <- droplevels(subset(NeoAnts, Genus != ""))
+
+##  create a new column called GenusSpecies
+NeoAnts <- NeoAnts %>%
+  mutate(GenusSpecies = ifelse(Best_guess_binomial == "", paste(Genus), paste(Best_guess_binomial)))
+
+## Make it a factor
+NeoAnts$GenusSpecies <- as.factor(NeoAnts$GenusSpecies)
+
+## Export just the GenusSpecies column
+Ant_species <- as.factor(levels(NeoAnts$GenusSpecies))
+
+## Save it as a file
+write.csv(Ant_species, "Ant_species.csv")
+```

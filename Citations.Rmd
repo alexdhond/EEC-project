@@ -1,0 +1,36 @@
+---
+title: "Citations"
+author: "Alex Dhond"
+date: "8/16/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This script is for generating citations for the write up - I am not sure if I will use all of these citations in the write up, but they are all here for all packages I used
+
+```{r}
+## R citation ##
+citation()
+
+## Data manipulation ## 
+citation("dplyr")
+citation("tidyr")
+
+## Modelling ##
+citation("vegan")
+citation("lme4")
+citation("car")
+citation("MuMIn")
+citation("merTools")
+citation("optimx")
+citation("DHARMa")
+
+## Plotting ##
+citation("ggplot2")
+citation("ggpubr")
+citation("cowplot")
+```
+

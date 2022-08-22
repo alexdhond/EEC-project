@@ -1,0 +1,381 @@
+---
+title: "1_Data_Manipulation"
+author: "Alex Dhond"
+date: "7/19/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The purpose of this script is to load in the PREDICTS data and filter it down so I can get data about the species and sites for Neotropical ants, dung beetles, and the combination of both. Some of the code was provided by Adriana De Palma for use in processing the PREDICTS data, which I have adapted here.
+
+### For clearing the workspace prior to running
+```{r}
+rm(list=ls())
+```
+
+### Load the required packages
+```{r}
+library(dplyr) # data manipulation
+library(tidyr) # data manipulation
+library(taxize) #for linking the NCBI taxonomy to check if the dung beetles I have are dung beetles
+```
+
+### Load in the most updated version of the PREDICTS database
+```{r}
+diversity <- readRDS("UPDATED.rds")
+```
+
+### See which studies are missing sampling efforts
+```{r}
+studies_check <- diversity %>%
+  # filter the rows where Sampling efforts are NA
+  filter(is.na(Sampling_effort)) %>%
+  # keep only unique studies
+  distinct(SS) %>%
+  # pull the vector
+  pull(SS)
+
+diversity %>%
+  # filter the rows where studies are those that had missing sampling efforts (above)
+  filter(SS %in% studies_check) %>%
+  # drop missing levels
+  droplevels() %>%
+  # pull out the sampling efforts of these studies
+  pull(Sampling_effort)%>%
+  # summarise to check that ALL the data are NAs
+  summary()
+```
+
+### Replace missing sampling efforts with 1
+```{r}
+diversity <- diversity %>%
+  
+  # replace missing sampling effort values with 1
+  mutate(x = replace_na(Sampling_effort, 1)) %>%
+  
+  # group by Study
+  group_by(SS) %>%
+  
+  # check how many sampling efforts there are in each study
+  mutate(n_sample_effort = n_distinct(Sampling_effort),
+         # get the maximum sampling effort for the studies
+         
+         max_sample_effort = max(Sampling_effort)
+         ) %>%
+  
+  ungroup() %>%
+  
+  # if the study has more than one sampling effort, correct the abundance
+
+    # so if there's only one sampling effort, then leave the dividing effort as empty because we don't want to change the abundances when we do the divisions. Otherwise, we give it the maximum sampling effort.
+  mutate(DividingEffort = ifelse(n_sample_effort == 1, NA, max_sample_effort)) %>%
+  
+  # if the diversity metric isn't sensitive to the effort, then we'll change the value to NA too (so we won't end up changing the measurement), otherwise leave it as it is
+  mutate(DividingEffort = ifelse(Diversity_metric_is_effort_sensitive == FALSE, NA, DividingEffort)) %>%
+  
+  # now let's create the effort corrected measurement by dividing the abundances by the sampling efforts
+  # where the dividing effort isn't NA (i.e. when it is necessary)
+  mutate(Corrected_sampling_effort = ifelse(is.na(DividingEffort), 
+                                            Sampling_effort,
+                                            Sampling_effort / DividingEffort),
+         Effort_corrected_measurement = ifelse(is.na(DividingEffort),
+                                               Measurement,
+                                               Measurement * Corrected_sampling_effort))
+  
+# summarise the corrected sampling efforts
+summary(diversity$Corrected_sampling_effort)
+```
+
+### Test that. Here, there are multiple sampling efforts in this source
+```{r}
+diversity %>% 
+  # filter out the test study
+  filter(SS == "AD1_2001__Liow 1") %>% 
+  # select out the columns to check
+  dplyr::select(Measurement, Effort_corrected_measurement, Sampling_effort, Corrected_sampling_effort)
+```
+
+
+### Here, the effort corrected measurement and the measurement should be the same, since there is only one sampling effort
+```{r}
+diversity %>% 
+  filter(SS == "AD1_2004__Darvill 1") %>% 
+  dplyr::select(Measurement, Effort_corrected_measurement,
+                Sampling_effort, Corrected_sampling_effort)
+```
+
+### Test a study of species richness to ensure it works
+```{r}
+diversity %>% 
+  # filter out the test study
+  filter(SS == "AD1_2011__Holzschuh 2") %>% 
+  # select out the columns to check
+  dplyr::select(Measurement, Effort_corrected_measurement,
+                Sampling_effort, Corrected_sampling_effort)
+```
+
+### Merge identical sites together
+Merge any sites that are the same land-use type and have identical coordinates, sampling start and end dates
+```{r}
+diversity <- diversity %>%
+  
+  # group by aspects of the sites that should be identical if we need to merge the abundances
+  # I only want to merge abundances if they are within the same study and block
+  # as I'm assuming that even if the locations and sampling times are the same, if the blocks or studies are different, then there is some good reason for this.
+  group_by(Source_ID, Study_number, Study_name, Block,
+           #diversity metric type
+           Diversity_metric, Diversity_metric_type, Diversity_metric_unit,
+           Diversity_metric_is_effort_sensitive,
+           
+           #details of the sites
+           Predominant_habitat, Use_intensity, Years_since_fragmentation_or_conversion,
+           
+           #details of the sampling method
+           Sampling_method, Sampling_effort_unit,
+           
+           #species identity
+           Study_common_taxon, Rank_of_study_common_taxon,
+           Taxon_number, Taxon_name_entered,
+           Indication, Parsed_name,
+           Best_guess_binomial, COL_ID, Taxon, Name_status,
+           Rank, Kingdom, Phylum, Class, Order, Family, Genus, Species,
+           Higher_taxon,
+           
+           #site location
+           Longitude, Latitude,
+           
+           #sampling time
+           Sample_start_earliest, Sample_end_latest, Sample_date_resolution) %>%
+  
+  # if the diversity metric is occurrence:
+  #   if it is present at all, give it a 1, if it is always absent, give it a 0,
+  # otherwise (if the metric is either abundance or species richness):
+  #   calculate the weighted abundance/richness for each taxonomic group, weighted by sampling effort
+  
+  mutate(merged_diversity = 
+           ifelse(Diversity_metric_type == "Occurrence",
+                  # if any of the occurrence values are 1, `any` will return TRUE. If you sum a logical, TRUE becomes 1 and FALSE becomes 0
+                  sum(any(Effort_corrected_measurement > 0)),
+                  
+                  # note that since we've already corrected the sampling effort, this is essentially a mean rather than a weighted mean for abundance measurements. It's a weighted mean for species richness though where sampling efforts vary.
+                  stats::weighted.mean(x = Effort_corrected_measurement,
+                                       w = Corrected_sampling_effort))
+         )
+
+# pull out the grouping data (so we can double check how many records we're merging for each)
+group_dat <- diversity %>% 
+  group_data() %>%
+  mutate(nvals_merged = lengths(.rows),
+         merge_ID = row_number())
+
+# ungroup the diversity data for future use
+diversity <- ungroup(diversity)
+
+# create a dataset where we can extract just the merged data if we want to
+diversity_merged <- diversity %>%
+  left_join(group_dat)
+```
+
+### Check that the merging has worked
+```{r}
+# check that the merging has worked (row numbers should be equal right now)
+nrow(diversity) == nrow(diversity_merged)
+```
+
+### Run some tests to see that the merging has worked for all of the sites
+```{r}
+test_data <- diversity_merged %>%
+  filter(nvals_merged > 1) %>%
+  distinct(merge_ID, .keep_all = TRUE)
+
+test1 <- diversity_merged %>%
+  filter(merge_ID == test_data$merge_ID[1]) %>%
+  dplyr::select(SS, SSB,
+         Diversity_metric, Diversity_metric_type, Diversity_metric_unit,
+         Predominant_habitat, Use_intensity, Years_since_fragmentation_or_conversion,
+         Sampling_method, Sampling_effort_unit,
+         Study_common_taxon, Rank_of_study_common_taxon,
+         Taxon_name_entered,
+         Best_guess_binomial,
+         Longitude, Latitude,
+         Sample_start_earliest, Sample_end_latest, Sample_date_resolution,
+         Effort_corrected_measurement,
+         Corrected_sampling_effort,
+         merged_diversity,
+         .rows,
+         nvals_merged,
+         merge_ID
+         )
+
+test1
+```
+### Run another test (AD2 Marques 2017 needed merging)
+```{r}
+test2 <- diversity_merged %>%
+  filter(merge_ID == test_data$merge_ID[8000]) %>%
+  dplyr::select(SS, SSB,
+         Diversity_metric, Diversity_metric_type, Diversity_metric_unit,
+         Predominant_habitat, Use_intensity, Years_since_fragmentation_or_conversion,
+         Sampling_method, Sampling_effort_unit,
+         Study_common_taxon, Rank_of_study_common_taxon,
+         Taxon_name_entered,
+         Best_guess_binomial,
+         Longitude, Latitude,
+         Sample_start_earliest, Sample_end_latest, Sample_date_resolution,
+         Effort_corrected_measurement,
+         Corrected_sampling_effort,
+         merged_diversity,
+         .rows,
+         nvals_merged,
+         merge_ID
+         )
+
+test2
+```
+
+### Check studies that did not need merging
+```{r}
+test_data <- diversity_merged %>%
+  filter(nvals_merged == 1) %>%
+  distinct(merge_ID, .keep_all = TRUE)
+
+paste(test_data$SS[1])
+```
+
+### Run a final test for non-merged sites - test 3
+```{r}
+test3 <- diversity_merged %>%
+  filter(merge_ID == test_data$merge_ID[1]) %>%
+  dplyr::select(SS, SSB,
+         Diversity_metric, Diversity_metric_type, Diversity_metric_unit,
+         Predominant_habitat, Use_intensity, Years_since_fragmentation_or_conversion,
+         Sampling_method, Sampling_effort_unit,
+         Study_common_taxon, Rank_of_study_common_taxon,
+         Taxon_name_entered,
+         Best_guess_binomial,
+         Longitude, Latitude,
+         Sample_start_earliest, Sample_end_latest, Sample_date_resolution,
+         Effort_corrected_measurement,
+         Corrected_sampling_effort,
+         merged_diversity,
+         .rows,
+         nvals_merged,
+         merge_ID
+         )
+
+test3
+```
+### Check how often I am merging values
+```{r}
+hist(diversity_merged$nvals_merged)
+```
+### Look at the study where 90 values were merged
+This is an extreme case, but all the sites have identical coordinates and land use so the merging was useful
+```{r}
+diversity_merged %>% 
+  filter(nvals_merged == 90)
+```
+
+### Subset the merged diversity data into separate dataframes
+Create a dataframe with just Dung beetles, just Ants, and a combined dataframe. Since this is before condensing down to just the sites data, I can use these dataframes to get lists of the unique species in the Neotropics, for use when I create a trophic categorization.
+```{r}
+#rename "Predominant habitat" to "Predominant land use"
+diversity_merged <- rename(diversity_merged, Predominant_land_use = Predominant_habitat)
+
+#subset out all other taxa except for insects
+insects <- droplevels(subset(diversity_merged, Class=="Insecta"))
+
+#create Neotropical dung beetles dataframe
+NeoDungBeetles <- droplevels(subset(insects, Family == "Scarabaeidae" | Family== "Geotrupidae"))
+NeoDungBeetles <- droplevels(subset(NeoDungBeetles, Realm == "Neotropic"))
+
+#create Neotropical ants dataframe
+NeoAnts <- droplevels(subset(insects, Family == "Formicidae"))
+NeoAnts <- droplevels(subset(NeoAnts, Realm == "Neotropic"))
+
+#create dataframe with both in it
+NeoAntDungBeetles <- droplevels(subset(insects, Family == "Scarabaeidae" | Family== "Geotrupidae" | Family == "Formicidae"))
+NeoAntDungBeetles <- droplevels(subset(NeoAntDungBeetles, Realm == "Neotropic"))
+```
+
+### Check if the Scarabaeidae beetles I have are dung beetles for the dung beetles dataset
+Create a new dataset of only the Scarabaeidae family, run through the unique genera, and compare this to the NCBI online taxonomy.
+```{r}
+#Make an only scarab beetle dataset
+scarab_check <- droplevels(subset(NeoDungBeetles, Family == "Scarabaeidae"))
+ 
+# Find the unique genus in dataset
+scarab_check<- unique(scarab_check$Genus)
+ 
+# Make it a character vector so it is compatible with tax name
+scarab_check <- as.character(scarab_check)
+ 
+# Match genus names to a subfamily through ncbi classification and save as dataframe
+id <- tax_name(query = c(scarab_check), get = c("subfamily"), db = "ncbi")
+ 
+# Use the get_uid command to search NCBI for the genus names, if you can a taxid (a string of numbers) then it worked, if you get NA then it didn't find anything
+uid<-get_uid(c(scarab_check))
+ 
+# Post results into dataframe
+uid<-as.data.frame(uid)
+
+# Only need the column that specifies whether there was a match so delete all other columns
+uid <- uid[ -c(1,2,4,5,6) ]
+ 
+# Column bind id and uid
+ids<-cbind(uid, id)
+ 
+# All of the found ids are dung beetles - all were scarabaeinae.
+# Some rows have the family name but no genera information - since there is no genera information I will have to remove the rows that only have the family identified.
+
+ 
+#Scarab _check is the length of every observation of the family scarabaeidae
+scarab_check <- droplevels(subset(NeoDungBeetles, Family == "Scarabaeidae"))
+nrow(scarab_check)
+#length is  102176
+ 
+#now we just want to take the genus column from only_scarabs and remove any blanks
+Genus <- subset(scarab_check, select=c("Genus"))
+Genus<-na.omit(Genus)
+Genus<- droplevels(subset(Genus, Genus != ""))
+nrow(Genus)
+#length is 101696
+ 
+102176 - 101696
+ 
+#So there are 480 observations where there is family but no genus classification for scarabaeidae - so I can't determine whether they are dung beetles or not. 
+ 
+test<-NeoDungBeetles[!(NeoDungBeetles$Family=="Scarabaeidae" & NeoDungBeetles$Genus==""),]
+ 
+#test that works
+nrow(test)
+nrow(NeoDungBeetles)
+
+101725 - 102205 # give 480 - so the method works
+
+## check the table for counts of family
+table(test$Family)
+```
+
+### Because I will be classifying Ants into trophic groups based on genus accounts, and because dung beetles also need to be identified at the genus level to ensure they are dung beetles, I will remove all rows where genus is unspecified.
+```{r}
+# Finally, update the dataframes so that Genus does not have any NAs
+NeoAnts <- droplevels(subset(NeoAnts, Genus!=""))
+NeoDungBeetles <- droplevels(subset(NeoDungBeetles, Genus!=""))
+NeoAntDungBeetles <- droplevels(subset(NeoAntDungBeetles, Genus != ""))
+```
+
+### Save these as new dataframes for easier loading
+```{r}
+#create dung beetle file
+write.csv(NeoDungBeetles, "NeoDungBeetles.csv")
+#create ant file
+write.csv(NeoAnts, "NeoAnts.csv")
+#create combined file
+write.csv(NeoAntDungBeetles, "NeoAntDungBeetles.csv")
+```
+
+This is the end of this script
